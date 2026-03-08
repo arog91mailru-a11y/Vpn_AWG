@@ -420,7 +420,7 @@ def main():
         query = update.callback_query
         await query.answer()
         await query.edit_message_text(
-            "✏️ Введите имя клиента\n\nТолько латиница, цифры, _ или -\nНапример: phone, laptop, work. ВВЕДИТЕ СВОЙ КОГНОМЕН перед именем, прим: Lev.Planshet или Lev.Telefon"
+            "✏️ Введите имя клиента\n\nТолько латиница, цифры, _ или -\nНапример: phone, laptop, work. ВВЕДИТЕ СВОЙ КОГНОМЕН перед именем клиента, прим: Lev.Planshet или Lev.Telefon"
         )
         return WAITING_NAME
 
@@ -428,7 +428,6 @@ def main():
         entry_points=[CallbackQueryHandler(add_entry, pattern="^add$")],
         states={WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)]},
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
     )
 
     app.add_handler(CommandHandler("start", start))
