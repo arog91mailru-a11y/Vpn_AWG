@@ -205,6 +205,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("del_"):
         await do_delete(query, data[4:])
 
+    elif data.startswith("confirm_del_"):
+        await confirm_delete(query, data[12:])
+
     elif data.startswith("client_"):
         await show_client(query, data[7:])
 
@@ -309,6 +312,20 @@ async def show_status(query):
 # Удаление
 # ─────────────────────────────────────────────
 async def do_delete(query, name):
+    conf_path = f"{CLIENTS_DIR}/{name}.conf"
+    if not os.path.exists(conf_path):
+        await query.edit_message_text(f"❌ Клиент {name} не найден.", reply_markup=back_kb())
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{name}")],
+        [InlineKeyboardButton("❌ Отмена",      callback_data="delete")],
+    ])
+    await query.edit_message_text(
+        f"🗑 Удаление клиента {name}\n\nХорошо подумал? Это действие необратимо.",
+        reply_markup=keyboard
+    )
+
+async def confirm_delete(query, name):
     conf_path = f"{CLIENTS_DIR}/{name}.conf"
     if not os.path.exists(conf_path):
         await query.edit_message_text(f"❌ Клиент {name} не найден.", reply_markup=back_kb())
