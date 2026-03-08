@@ -3,7 +3,7 @@
 # AmneziaWG — Telegram бот управления
 # =============================================================================
 
-import os, sys, subprocess, logging, json, zlib, base64, struct, random
+import os, sys, subprocess, logging, json, zlib, base64, struct
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -84,16 +84,17 @@ WAITING_NAME = 1
 # Генерация конфига в формате Amnezia
 # ─────────────────────────────────────────────
 def gen_obfs():
+    """Читаем параметры обфускации с сервера — клиент должен совпадать с сервером"""
     return {
-        "Jc":   str(random.randint(3, 10)),
-        "Jmin": str(random.randint(10, 50)),
-        "Jmax": str(random.randint(50, 100)),
-        "S1":   str(random.randint(20, 100)),
-        "S2":   str(random.randint(20, 100)),
-        "H1":   str(random.randint(100000000, 2000000000)),
-        "H2":   str(random.randint(100000000, 2000000000)),
-        "H3":   str(random.randint(100000000, 2000000000)),
-        "H4":   str(random.randint(100000000, 2000000000)),
+        "Jc":   srv.get("JC",   "4"),
+        "Jmin": srv.get("JMIN", "40"),
+        "Jmax": srv.get("JMAX", "70"),
+        "S1":   srv.get("S1",   "0"),
+        "S2":   srv.get("S2",   "0"),
+        "H1":   srv.get("H1",   "1"),
+        "H2":   srv.get("H2",   "2"),
+        "H3":   srv.get("H3",   "3"),
+        "H4":   srv.get("H4",   "4"),
     }
 
 def make_vpn_link(client_priv, client_pub, client_ip, psk, obfs, name):
