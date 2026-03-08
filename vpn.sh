@@ -34,11 +34,16 @@ show_header() {
 }
 
 show_qr() {
-    local CONF="$CLIENTS_DIR/$1.conf"
+    local NAME="$1"
+    local VPNLINK="$CLIENTS_DIR/${NAME}.vpnlink"
+    if [[ ! -f "$VPNLINK" ]]; then
+        echo -e "${RED}vpn:// ссылка не найдена для ${NAME}${NC}"
+        return
+    fi
     if command -v qrencode &>/dev/null; then
-        echo -e "${CYAN}QR-код:${NC}"
+        echo -e "${CYAN}QR-код (сканировать через AmneziaVPN):${NC}"
         echo ""
-        qrencode -t ansiutf8 -l L < "$CONF"
+        qrencode -t ansiutf8 -l L -r "$VPNLINK"
         echo ""
     fi
 }
@@ -57,27 +62,66 @@ add_client() {
 
     CLIENT_PRIVATE=$(awg genkey)
     CLIENT_PUBLIC=$(echo "$CLIENT_PRIVATE" | awg pubkey)
+    CLIENT_PSK=$(awg genpsk)
     CLIENT_IP="${VPN_SUBNET}.$(next_ip)"
 
-    printf "\n# Client: %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n" \
-        "$NAME" "$CLIENT_PUBLIC" "$CLIENT_IP" >> "$AWG_CONF"
+    # Случайные параметры обфускации
+    JC=$((RANDOM % 8 + 3))
+    JMIN=$((RANDOM % 41 + 10))
+    JMAX=$((RANDOM % 51 + 50))
+    S1=$((RANDOM % 81 + 20))
+    S2=$((RANDOM % 81 + 20))
+    H1=$((RANDOM % 1900000000 + 100000000))
+    H2=$((RANDOM % 1900000000 + 100000000))
+    H3=$((RANDOM % 1900000000 + 100000000))
+    H4=$((RANDOM % 1900000000 + 100000000))
 
-    awg set "$VPN_IFACE" peer "$CLIENT_PUBLIC" allowed-ips "${CLIENT_IP}/32"
+    printf "\n# Client: %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n" \
+        "$NAME" "$CLIENT_PUBLIC" "$CLIENT_PSK" "$CLIENT_IP" >> "$AWG_CONF"
+
+    echo "$CLIENT_PSK" | awg set "$VPN_IFACE" peer "$CLIENT_PUBLIC" \
+        preshared-key /dev/stdin allowed-ips "${CLIENT_IP}/32"
 
     {
         printf "[Interface]\n"
         printf "PrivateKey = %s\n" "$CLIENT_PRIVATE"
         printf "Address = %s/32\n" "$CLIENT_IP"
         printf "DNS = 1.1.1.1\n"
-        printf "Jc = 4\nJmin = 40\nJmax = 70\n"
-        printf "S1 = 0\nS2 = 0\n"
-        printf "H1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n"
+        printf "Jc = %s\nJmin = %s\nJmax = %s\n" "$JC" "$JMIN" "$JMAX"
+        printf "S1 = %s\nS2 = %s\n" "$S1" "$S2"
+        printf "H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n" "$H1" "$H2" "$H3" "$H4"
         printf "\n[Peer]\n"
         printf "PublicKey = %s\n" "$SERVER_PUBLIC"
+        printf "PresharedKey = %s\n" "$CLIENT_PSK"
         printf "Endpoint = %s:%s\n" "$SERVER_IP" "$SERVER_PORT"
         printf "AllowedIPs = 0.0.0.0/0\n"
         printf "PersistentKeepalive = 25\n"
     } > "$CLIENTS_DIR/${NAME}.conf"
+
+    # Генерируем vpn:// ссылку для AmneziaVPN
+    python3 - "$NAME" "$CLIENT_PRIVATE" "$CLIENT_PUBLIC" "$CLIENT_IP" "$CLIENT_PSK" \
+        "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$H1" "$H2" "$H3" "$H4" \
+        "$SERVER_PUBLIC" "$SERVER_IP" "$SERVER_PORT" \
+        "$CLIENTS_DIR/${NAME}.vpnlink" << 'PYEOF'
+import sys, json, zlib, base64, struct
+name,priv,pub,ip,psk,jc,jmin,jmax,s1,s2,h1,h2,h3,h4,srv_pub,srv_ip,srv_port,out = sys.argv[1:]
+obfs = {"Jc":jc,"Jmin":jmin,"Jmax":jmax,"S1":s1,"S2":s2,"H1":h1,"H2":h2,"H3":h3,"H4":h4}
+wg = (f"[Interface]\nAddress = {ip}/32\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\n"
+      f"PrivateKey = {priv}\nJc = {jc}\nJmin = {jmin}\nJmax = {jmax}\n"
+      f"S1 = {s1}\nS2 = {s2}\nH1 = {h1}\nH2 = {h2}\nH3 = {h3}\nH4 = {h4}\n\n"
+      f"[Peer]\nPublicKey = {srv_pub}\nPresharedKey = {psk}\n"
+      f"AllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {srv_ip}:{srv_port}\nPersistentKeepalive = 25\n")
+lc = {**obfs,"allowed_ips":["0.0.0.0/0","::/0"],"clientId":pub,"client_ip":ip,
+      "client_priv_key":priv,"client_pub_key":pub,"config":wg,"hostName":srv_ip,
+      "mtu":"1376","persistent_keep_alive":"25","port":int(srv_port),"psk_key":psk,"server_pub_key":srv_pub}
+c = {"containers":[{"awg":{**obfs,"last_config":json.dumps(lc,indent=4),
+     "port":srv_port,"subnet_address":".".join(ip.split(".")[:3])+".0","transport_proto":"udp"},
+     "container":"amnezia-awg"}],"defaultContainer":"amnezia-awg","description":name,
+     "dns1":"1.1.1.1","dns2":"1.0.0.1","hostName":srv_ip,"nameOverriddenByUser":True}
+b = json.dumps(c,ensure_ascii=False).encode()
+p = struct.pack('>I',len(b)) + zlib.compress(b)
+open(out,'w').write('vpn://' + base64.urlsafe_b64encode(p).decode().rstrip('='))
+PYEOF
 
     echo ""
     echo -e "${GREEN}✓ Клиент '${NAME}' добавлен — IP: ${CLIENT_IP}${NC}"
