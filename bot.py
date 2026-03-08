@@ -261,8 +261,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_client(query, data[7:])
     elif data.startswith("conf_"):
         await send_conf(query, data[5:])
+
+    elif data.startswith("share_"):
+        await send_share(query, data[6:])
     elif data.startswith("qr_"):
         await send_qr(query, data[3:])
+
+    elif data.startswith("share_"):
+        await send_share(query, data[6:])
+
+    elif data.startswith("share_"):
+        await share_code(query, data[6:])
 
 # ─────────────────────────────────────────────
 # Список клиентов
@@ -297,9 +306,10 @@ async def show_list(query):
 
 async def show_client(query, name):
     keyboard = [
-        [InlineKeyboardButton("📄 Скачать .conf", callback_data=f"conf_{name}")],
-        [InlineKeyboardButton("📱 QR-код",         callback_data=f"qr_{name}")],
-        [InlineKeyboardButton("◀️ Назад",          callback_data="list")],
+        [InlineKeyboardButton("📄 Скачать .conf",    callback_data=f"conf_{name}")],
+        [InlineKeyboardButton("📱 QR-код",            callback_data=f"qr_{name}")],
+        [InlineKeyboardButton("🔗 Поделиться кодом", callback_data=f"share_{name}")],
+        [InlineKeyboardButton("◀️ Назад",             callback_data="list")],
     ]
     await query.edit_message_text(f"👤 Клиент: {name}\n\nВыберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -311,6 +321,42 @@ async def send_conf(query, name):
         caption=f"📄 Конфиг клиента {name}"
     )
 
+async def send_share(query, name):
+    """Отправляем vpn:// ссылку текстом и .vpn файлом для импорта в AmneziaVPN"""
+    vpn_path  = f"{CLIENTS_DIR}/{name}.vpnlink"
+    vpn_file  = f"/tmp/{name}.vpn"
+    if not os.path.exists(vpn_path):
+        await query.message.reply_text(f"❌ vpn:// ссылка не найдена для {name}")
+        return
+    link = open(vpn_path).read().strip()
+    await query.message.reply_text(
+        f"🔗 Код подключения для AmneziaVPN:\n\n`{link}`\n\nВставьте в поле Соединение → Вставьте ключ",
+        parse_mode="Markdown"
+    )
+    # Отправляем как .vpn файл
+    import shutil
+    shutil.copy(vpn_path, vpn_file)
+    await query.message.reply_document(
+        document=open(vpn_file, "rb"),
+        filename=f"{name}.vpn",
+        caption="📁 Файл .vpn для импорта в AmneziaVPN\nФайл с настройками подключения → выберите этот файл"
+    )
+    os.remove(vpn_file)
+
+async def send_share(query, name):
+    vpn_path = f"{CLIENTS_DIR}/{name}.vpnlink"
+    if not os.path.exists(vpn_path):
+        await query.message.reply_text(f"❌ Файл не найден для {name}")
+        return
+    vpn_code = open(vpn_path).read().strip()
+    await query.message.reply_text(
+        f"📤 Код для импорта в AmneziaVPN\n\n"
+        f"Скопируйте код ниже и вставьте в приложении:\n"
+        f"+ → Вставить ключ\n\n"
+        f"`{vpn_code}`",
+        parse_mode="Markdown"
+    )
+
 async def send_qr(query, name):
     conf_path = f"{CLIENTS_DIR}/{name}.conf"
     vpn_path  = f"{CLIENTS_DIR}/{name}.vpnlink"
@@ -318,7 +364,7 @@ async def send_qr(query, name):
 
     # QR 1 — из .conf для AmneziaWG
     try:
-        subprocess.run(["qrencode", "-o", qr_path, "-l", "L", "-r", conf_path], check=True)
+        subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
         await query.message.reply_photo(
             photo=open(qr_path, "rb"),
             caption=f"📱 QR для AmneziaWG (стандартный клиент)\nКлиент: {name}"
@@ -327,17 +373,22 @@ async def send_qr(query, name):
     except Exception as e:
         await query.message.reply_text(f"❌ Ошибка QR (AmneziaWG): {e}")
 
-    # QR 2 — из vpn:// для AmneziaVPN
-    if os.path.exists(vpn_path):
-        try:
-            subprocess.run(["qrencode", "-o", qr_path, "-l", "L", "-r", vpn_path], check=True)
-            await query.message.reply_photo(
-                photo=open(qr_path, "rb"),
-                caption=f"📱 QR для AmneziaVPN (с раздельным туннелированием)\nКлиент: {name}"
-            )
-            os.remove(qr_path)
-        except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка QR (AmneziaVPN): {e}")
+
+
+async def share_code(query, name):
+    vpn_path = f"{CLIENTS_DIR}/{name}.vpn"
+    if not os.path.exists(vpn_path):
+        await query.message.reply_text(f"❌ .vpn файл не найден для {name}")
+        return
+    with open(vpn_path) as f:
+        code = f.read().strip()
+    await query.message.reply_text(
+        f"🔗 Код для AmneziaVPN — клиент {name}\n\n"
+        f"Скопируйте код и вставьте в приложении:\n"
+        f"Подключение → вставьте ключ\n\n"
+        f"`{code}`",
+        parse_mode="Markdown"
+    )
 
 # ─────────────────────────────────────────────
 # Статус
@@ -404,7 +455,7 @@ async def confirm_delete(query, name):
             new_lines.append(line)
     with open(AWG_CONF, "w") as f:
         f.write("\n".join(new_lines))
-    for ext in [".conf", ".vpnlink"]:
+    for ext in [".conf", ".vpn"]:
         path = f"{CLIENTS_DIR}/{name}{ext}"
         if os.path.exists(path):
             os.remove(path)
@@ -449,7 +500,7 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Сохраняем vpn:// ссылку
     vpn_link = make_vpn_link(private, public, client_ip, psk, obfs, name)
-    vpnlink_path = f"{CLIENTS_DIR}/{name}.vpnlink"
+    vpnlink_path = f"{CLIENTS_DIR}/{name}.vpn"
     with open(vpnlink_path, "w") as f:
         f.write(vpn_link)
 
@@ -473,16 +524,7 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # QR 2 — из vpn:// для AmneziaVPN
-    try:
-        subprocess.run(["qrencode", "-o", qr_path, "-l", "L", "-r", vpnlink_path], check=True)
-        await update.message.reply_photo(
-            photo=open(qr_path, "rb"),
-            caption=f"📱 QR для AmneziaVPN (с раздельным туннелированием)"
-        )
-        os.remove(qr_path)
-    except:
-        pass
+
 
     await main_menu_msg(update.message)
     return ConversationHandler.END
