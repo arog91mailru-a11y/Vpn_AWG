@@ -420,7 +420,7 @@ def main():
         query = update.callback_query
         await query.answer()
         await query.edit_message_text(
-            "✏️ Введите имя клиента\n\nТолько латиница, цифры, _ или -\nНапример: phone, laptop, work"
+            "✏️ Введите имя клиента\n\nТолько латиница, цифры, _ или -\nНапример: phone, laptop, work. ВВЕДИТЕ СВОЙ КОГНОМЕН перед именем, прим: Lev.Planshet или Lev.Telefon"
         )
         return WAITING_NAME
 
