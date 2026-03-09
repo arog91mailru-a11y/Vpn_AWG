@@ -417,6 +417,7 @@ async def main_menu(msg, user_id: int, edit=False):
             [InlineKeyboardButton(pending_label,             callback_data="manage_users")],
             [InlineKeyboardButton("📊 Статус сервера",       callback_data="status")],
             [InlineKeyboardButton("🧹 Очистить мусор",       callback_data="cleanup")],
+            [InlineKeyboardButton("📖 Инструкция",           callback_data="help")],
         ]
         text = (
             f"🔐 AmneziaWG — Панель администратора\n\n"
@@ -431,6 +432,7 @@ async def main_menu(msg, user_id: int, edit=False):
         kb = [
             [InlineKeyboardButton("➕ Добавить устройство",  callback_data="add")],
             [InlineKeyboardButton("📋 Мои устройства",       callback_data="my_devices")],
+            [InlineKeyboardButton("📊 Статус сервера",       callback_data="status")],
             [InlineKeyboardButton("📖 Инструкция",           callback_data="help")],
         ]
         text = (
@@ -514,7 +516,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "manage_users" and is_admin:
         await show_manage_users(query)
 
-    elif data == "status" and is_admin:
+    elif data == "status":
         await show_status(query)
 
     elif data == "cleanup" and is_admin:
@@ -865,7 +867,10 @@ async def show_help(query):
     text = (
         "📖 Инструкция\n\n"
         "➕ *Добавить устройство* — создать VPN-профиль для телефона, ноутбука, ПК и т.д.\n\n"
-        "📋 *Мои устройства* — список ваших профилей, скачать конфиг или QR-код.\n\n"
+        "📋 *Мои устройства* — список ваших профилей. Нажмите на устройство чтобы:\n"
+        "• скачать конфиг или QR-код\n"
+        "• удалить устройство 🗑\n\n"
+        "📊 *Статус сервера* — проверить работает ли VPN.\n\n"
         "⚠️ *Важно — на каждое устройство свой профиль!*\n"
         "Если использовать один конфиг на двух устройствах одновременно — "
         "оба будут глючить и отваливаться. Создайте отдельный профиль для каждого.\n\n"
