@@ -174,8 +174,9 @@ list_clients() {
     for CONF in "$CLIENTS_DIR"/*.conf; do
         NAME=$(basename "$CONF" .conf)
         CLIENT_IP=$(grep "^Address" "$CONF" | awk '{print $3}' | cut -d'/' -f1)
-        # PublicKey берём из секции [Peer] клиентского конфига
-        CLIENT_PUBLIC=$(awk '/^\[Peer\]/{p=1} p && /^PublicKey/{print $3; exit}' "$CONF")
+        # PublicKey вычисляем из PrivateKey клиента
+        CLIENT_PRIVATE=$(awk '/^PrivateKey/{print $3; exit}' "$CONF")
+        CLIENT_PUBLIC=$(echo "$CLIENT_PRIVATE" | awg pubkey)
 
         HANDSHAKE=$(echo "$AWG_OUTPUT" | grep -A5 "$CLIENT_PUBLIC" | grep "latest handshake" | sed 's/.*latest handshake: //' || true)
         TRANSFER=$(echo "$AWG_OUTPUT" | grep -A5 "$CLIENT_PUBLIC" | grep "transfer" | sed 's/.*transfer: //' || true)
@@ -265,8 +266,9 @@ delete_client() {
     NAME="${NAMES[$((NUM-1))]}"
     CONF="$CLIENTS_DIR/${NAME}.conf"
 
-    # Берём PublicKey из секции [Peer] клиентского конфига
-    CLIENT_PUBLIC=$(awk '/^\[Peer\]/{p=1} p && /^PublicKey/{print $3; exit}' "$CONF")
+    # PublicKey вычисляем из PrivateKey клиента
+    CLIENT_PRIVATE=$(awk '/^PrivateKey/{print $3; exit}' "$CONF")
+    CLIENT_PUBLIC=$(echo "$CLIENT_PRIVATE" | awg pubkey)
 
     echo ""
     read -p "Удалить '$NAME'? (y/N): " CONFIRM

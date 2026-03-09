@@ -135,18 +135,16 @@ def get_user_clients(user_id: int) -> list:
     return [c for c in get_all_clients() if c.startswith(prefix)]
 
 def get_client_pub(name: str) -> str | None:
-    """Получить публичный ключ клиента из секции [Peer] его конфига"""
+    """Получить публичный ключ клиента из его PrivateKey"""
     try:
         with open(f"{CLIENTS_DIR}/{name}.conf") as f:
-            in_peer = False
             for line in f:
                 line = line.strip()
-                if line == "[Peer]":
-                    in_peer = True
-                elif line.startswith("["):
-                    in_peer = False
-                elif in_peer and line.startswith("PublicKey"):
-                    return line.split("=", 1)[1].strip()
+                if line.startswith("PrivateKey"):
+                    priv = line.split("=", 1)[1].strip()
+                    return subprocess.check_output(
+                        ["awg", "pubkey"], input=priv, text=True
+                    ).strip()
     except:
         pass
     return None
