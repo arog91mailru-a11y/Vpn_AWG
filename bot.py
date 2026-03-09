@@ -230,11 +230,20 @@ def get_clients():
     return sorted([f[:-5] for f in os.listdir(CLIENTS_DIR) if f.endswith(".conf")])
 
 def get_client_pub(name):
+    """Получаем публичный ключ клиента из приватного ключа в [Interface]"""
     try:
         with open(f"{CLIENTS_DIR}/{name}.conf") as f:
+            in_interface = False
             for line in f:
-                if line.startswith("PublicKey"):
-                    return line.split("=", 1)[1].strip()
+                line = line.strip()
+                if line == "[Interface]":
+                    in_interface = True
+                elif line.startswith("["):
+                    in_interface = False
+                elif in_interface and line.startswith("PrivateKey"):
+                    priv = line.split("=", 1)[1].strip()
+                    pub = subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
+                    return pub
     except:
         pass
     return None
@@ -329,7 +338,7 @@ async def show_list(query):
         hs    = fmt_handshake(stats.get("handshake", 0))
         rx    = fmt_bytes(stats.get("rx", 0))
         tx    = fmt_bytes(stats.get("tx", 0))
-        lines.append(f"• {name}\n  {hs}\n  ↓{rx} ↑{tx}")
+        lines.append(f"• {name} | {hs} | ↓{rx} ↑{tx}")
 
     kb = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"client_{n}")] for n in clients]
     kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
