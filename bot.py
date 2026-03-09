@@ -165,6 +165,7 @@ async def main_menu_msg(msg, edit=False):
         [InlineKeyboardButton("👥 Список клиентов",  callback_data="list")],
         [InlineKeyboardButton("🗑 Удалить клиента",  callback_data="delete")],
         [InlineKeyboardButton("📊 Статус сервера",   callback_data="status")],
+        [InlineKeyboardButton("📋 Инструкция",       callback_data="help")],
     ]
     text = f"🔐 AmneziaWG — Управление VPN\n\n🖥 Сервер: {SERVER_IP}:{SERVER_PORT}\n👤 Клиентов: {len(clients)}"
     if edit:
@@ -209,6 +210,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_qr(query, data[3:])
     elif data.startswith("share_"):
         await send_share(query, data[6:])
+    elif data == "help":
+        await show_help(query)
 
 # ── Список клиентов ────────────────────────────────────────────────────────────
 async def show_list(query):
@@ -285,6 +288,26 @@ async def send_share(query, name):
         filename=f"{name}.vpn",
         caption=f"📁 Файл .vpn для импорта в AmneziaVPN\nФайл с настройками → выберите этот файл"
     )
+
+# ── Инструкция ────────────────────────────────────────────────────────────────
+async def show_help(query):
+    text = (
+        "📋 Инструкция по подключению\n\n"
+        "⚠️ Каждому устройству — свой профиль!\n"
+        "Нельзя использовать один конфиг на нескольких устройствах — "
+        "это вызовет конфликты и разрывы у всех.\n\n"
+        "📝 Правило именования:\n"
+        "Имя.Устройство через точку:\n"
+        "• Lev.Phone — телефон Льва\n"
+        "• Lev.PC — компьютер Льва\n"
+        "• Artem.Telefon — телефон Артёма\n"
+        "• Artem.Nout — ноутбук Артёма\n\n"
+        "📲 Приложения:\n"
+        "• AmneziaWG — простое подключение\n"
+        "• AmneziaVPN — с раздельным туннелированием\n\n"
+        "Для подключения обратитесь к администратору."
+    )
+    await query.edit_message_text(text, reply_markup=back_kb())
 
 # ── Статус ─────────────────────────────────────────────────────────────────────
 async def show_status(query):
@@ -412,7 +435,7 @@ def main():
         query = update.callback_query
         await query.answer()
         await query.edit_message_text(
-            "✏️ Введите имя клиента\n\nТолько латиница, цифры, _ или -\nНапример: phone, laptop, work"
+            "✏️ Введите имя клиента\n\nФормат: Имя.Устройство\nНапример: Lev.Phone, Artem.PC, Ivan.Nout\n\nКаждому устройству — свой профиль!"
         )
         return WAITING_NAME
 
