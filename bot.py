@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, subprocess, logging, json, zlib, base64, struct
+import os, subprocess, logging, json, zlib, base64, struct, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -7,8 +7,9 @@ from telegram.ext import (
 )
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; NC='\033[0m'
-CONFIG_FILE = "/etc/amnezia/amneziawg/bot.env"
-ENV_FILE    = "/etc/amnezia/amneziawg/server.env"
+CONFIG_FILE  = "/etc/amnezia/amneziawg/bot.env"
+ENV_FILE     = "/etc/amnezia/amneziawg/server.env"
+
 
 def load_env(path):
     env = {}
@@ -24,27 +25,19 @@ def setup():
     print(f"\n{C}{B}{'='*50}{NC}")
     print(f"{C}{B}   AmneziaWG — Настройка Telegram бота{NC}")
     print(f"{C}{B}{'='*50}{NC}\n")
-    print(f"{B}Шаг 1: Токен бота{NC}")
-    print(f"  1. Найдите {Y}@BotFather{NC} в Telegram")
-    print(f"  2. Напишите {Y}/newbot{NC}")
-    print(f"  3. Скопируйте токен вида {Y}1234567890:AAF...{NC}\n")
     while True:
-        token = input("  Вставьте токен: ").strip()
+        token = input("  Вставьте токен бота: ").strip()
         if ":" in token and len(token) > 20: break
         print(f"  {R}Неверный формат токена{NC}")
-    print(f"\n{B}Шаг 2: Ваш Telegram ID{NC}")
-    print(f"  1. Найдите {Y}@userinfobot{NC} в Telegram")
-    print(f"  2. Напишите ему любое сообщение")
-    print(f"  3. Скопируйте число — ваш ID\n")
     while True:
-        admin_id = input("  Вставьте ваш ID: ").strip()
+        admin_id = input("  Вставьте ваш Telegram ID: ").strip()
         if admin_id.isdigit(): break
         print(f"  {R}ID должен быть числом{NC}")
     os.makedirs("/etc/amnezia/amneziawg", exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         f.write(f"BOT_TOKEN={token}\nADMIN_ID={admin_id}\n")
     os.chmod(CONFIG_FILE, 0o600)
-    print(f"\n{G}✓ Готово! Напишите /start вашему боту.{NC}\n")
+    print(f"\n{G}✓ Готово!{NC}\n")
 
 if not os.path.exists(CONFIG_FILE):
     setup()
@@ -60,13 +53,113 @@ VPN_SUBNET    = srv["VPN_SUBNET"]
 AWG_IFACE     = srv["VPN_IFACE"]
 CLIENTS_DIR   = "/etc/amnezia/amneziawg/clients"
 AWG_CONF      = "/etc/amnezia/amneziawg/awg0.conf"
-VPN_EXT       = ".vpn"   # расширение файла для AmneziaVPN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 WAITING_NAME = 1
 
-# ── Обфускация — берём параметры сервера ──────────────────────────────────────
+# ── Трафик ────────────────────────────────────────────────────────────────────
+def load_traffic():
+    try:
+        return json.load(open(TRAFFIC_FILE))
+    except:
+        return {}
+
+def save_traffic(data):
+    json.dump(data, open(TRAFFIC_FILE, "w"), indent=2)
+
+def get_awg_dump():
+    """Возвращает dict: pub_key -> {rx, tx, endpoint, handshake, allowed_ips}"""
+    try:
+        out = subprocess.check_output(["awg", "show", AWG_IFACE, "dump"], text=True)
+    except:
+        return {}
+    peers = {}
+    for line in out.strip().split("\n")[1:]:  # пропускаем первую строку (интерфейс)
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+        pub       = parts[0]
+        endpoint  = parts[2] if parts[2] != "(none)" else ""
+        allowed   = parts[3] if parts[3] != "(none)" else ""
+        handshake = int(parts[4]) if parts[4] not in ("0", "(none)") else 0
+        rx        = int(parts[5])
+        tx        = int(parts[6])
+        peers[pub] = {"rx": rx, "tx": tx, "endpoint": endpoint,
+                      "allowed": allowed, "handshake": handshake}
+    return peers
+
+def accumulate_traffic():
+    """Вызывается из cron каждые 5 минут — накапливает трафик"""
+    data   = load_traffic()
+    peers  = get_awg_dump()
+    now    = datetime.now()
+    month  = now.strftime("%Y-%m")
+
+    # Сопоставляем пиры с клиентами по allowed_ips
+    client_map = {}  # pub -> name
+    for f in os.listdir(CLIENTS_DIR):
+        if not f.endswith(".conf"):
+            continue
+        name = f[:-5]
+        with open(f"{CLIENTS_DIR}/{f}") as cf:
+            for line in cf:
+                if line.startswith("PublicKey"):
+                    pub = line.split("=", 1)[1].strip()
+                    client_map[pub] = name
+
+    for pub, stats in peers.items():
+        name = client_map.get(pub, pub[:8])
+        if name not in data:
+            data[name] = {}
+        if month not in data[name]:
+            data[name][month] = {"rx": 0, "tx": 0, "last_rx": 0, "last_tx": 0}
+
+        last_rx = data[name][month].get("last_rx", 0)
+        last_tx = data[name][month].get("last_tx", 0)
+
+        # AWG счётчики растут, но могут сброситься при перезагрузке
+        if stats["rx"] >= last_rx:
+            data[name][month]["rx"] += stats["rx"] - last_rx
+        else:
+            data[name][month]["rx"] += stats["rx"]  # сброс счётчика
+
+        if stats["tx"] >= last_tx:
+            data[name][month]["tx"] += stats["tx"] - last_tx
+        else:
+            data[name][month]["tx"] += stats["tx"]
+
+        data[name][month]["last_rx"] = stats["rx"]
+        data[name][month]["last_tx"] = stats["tx"]
+
+    save_traffic(data)
+
+def fmt_bytes(b):
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024**2:
+        return f"{b/1024:.1f} KB"
+    elif b < 1024**3:
+        return f"{b/1024**2:.1f} MB"
+    else:
+        return f"{b/1024**3:.2f} GB"
+
+def fmt_handshake(ts):
+    if not ts:
+        return "никогда"
+    diff = int(time.time()) - ts
+    if diff < 60:
+        return f"{diff} сек назад 🟢"
+    elif diff < 180:
+        return f"{diff//60} мин назад 🟢"
+    elif diff < 3600:
+        return f"{diff//60} мин назад"
+    elif diff < 86400:
+        return f"{diff//3600} ч назад"
+    else:
+        return f"{diff//86400} д назад"
+
+# ── Обфускация ─────────────────────────────────────────────────────────────────
 def gen_obfs():
     return {
         "Jc":   srv.get("JC",   "4"),
@@ -80,7 +173,6 @@ def gen_obfs():
         "H4":   srv.get("H4",   "4"),
     }
 
-# ── Генерация vpn:// ссылки ────────────────────────────────────────────────────
 def make_vpn_link(priv, pub, ip, psk, obfs, name):
     wg = (
         f"[Interface]\nAddress = {ip}/32\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\n"
@@ -104,7 +196,6 @@ def make_vpn_link(priv, pub, ip, psk, obfs, name):
     p = struct.pack('>I', len(b)) + zlib.compress(b)
     return "vpn://" + base64.urlsafe_b64encode(p).decode().rstrip('=')
 
-# ── .conf файл для AmneziaWG ───────────────────────────────────────────────────
 def make_wg_conf(priv, ip, psk, obfs):
     return "\n".join([
         "[Interface]",
@@ -138,6 +229,16 @@ def get_clients():
         return []
     return sorted([f[:-5] for f in os.listdir(CLIENTS_DIR) if f.endswith(".conf")])
 
+def get_client_pub(name):
+    try:
+        with open(f"{CLIENTS_DIR}/{name}.conf") as f:
+            for line in f:
+                if line.startswith("PublicKey"):
+                    return line.split("=", 1)[1].strip()
+    except:
+        pass
+    return None
+
 def awg_show():
     try:
         return subprocess.check_output(["awg", "show", AWG_IFACE], text=True)
@@ -148,10 +249,8 @@ def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ В меню", callback_data="back")]])
 
 def vpn_path(name):
-    """Путь к .vpn файлу — поддерживаем оба расширения для совместимости"""
-    p = f"{CLIENTS_DIR}/{name}{VPN_EXT}"
+    p = f"{CLIENTS_DIR}/{name}.vpn"
     if not os.path.exists(p):
-        # Совместимость со старым .vpnlink
         alt = f"{CLIENTS_DIR}/{name}.vpnlink"
         if os.path.exists(alt):
             return alt
@@ -165,6 +264,7 @@ async def main_menu_msg(msg, edit=False):
         [InlineKeyboardButton("👥 Список клиентов",  callback_data="list")],
         [InlineKeyboardButton("🗑 Удалить клиента",  callback_data="delete")],
         [InlineKeyboardButton("📊 Статус сервера",   callback_data="status")],
+        [InlineKeyboardButton("🧹 Очистить мусор",   callback_data="cleanup")],
         [InlineKeyboardButton("📋 Инструкция",       callback_data="help")],
     ]
     text = f"🔐 AmneziaWG — Управление VPN\n\n🖥 Сервер: {SERVER_IP}:{SERVER_PORT}\n👤 Клиентов: {len(clients)}"
@@ -198,6 +298,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выберите клиента для удаления:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "status":
         await show_status(query)
+    elif data == "cleanup":
+        await do_cleanup(query)
+    elif data == "help":
+        await show_help(query)
     elif data.startswith("del_"):
         await do_delete(query, data[4:])
     elif data.startswith("confirm_del_"):
@@ -210,8 +314,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_qr(query, data[3:])
     elif data.startswith("share_"):
         await send_share(query, data[6:])
-    elif data == "help":
-        await show_help(query)
 
 # ── Список клиентов ────────────────────────────────────────────────────────────
 async def show_list(query):
@@ -219,36 +321,43 @@ async def show_list(query):
     if not clients:
         await query.edit_message_text("👥 Клиентов нет.", reply_markup=back_kb())
         return
-    output = awg_show()
+    peers = get_awg_dump()
     lines = ["👥 Клиенты:\n"]
     for name in clients:
-        ip, pub = "", ""
-        with open(f"{CLIENTS_DIR}/{name}.conf") as f:
-            for line in f:
-                if line.startswith("Address"):
-                    ip = line.split("=")[1].strip().split("/")[0]
-                if line.startswith("PublicKey"):
-                    pub = line.split("=", 1)[1].strip()
-        handshake = "никогда"
-        if pub and pub in output:
-            for i, l in enumerate(output.split("\n")):
-                if pub in l:
-                    for j in range(i, min(i+6, len(output.split("\n")))):
-                        if "latest handshake" in output.split("\n")[j]:
-                            handshake = output.split("\n")[j].split(":", 1)[1].strip()
-        lines.append(f"• {name} — {ip} — {handshake}")
+        pub   = get_client_pub(name)
+        stats = peers.get(pub, {}) if pub else {}
+        hs    = fmt_handshake(stats.get("handshake", 0))
+        rx    = fmt_bytes(stats.get("rx", 0))
+        tx    = fmt_bytes(stats.get("tx", 0))
+        lines.append(f"• {name}\n  {hs}\n  ↓{rx} ↑{tx}")
+
     kb = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"client_{n}")] for n in clients]
     kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_client(query, name):
+    peers = get_awg_dump()
+    pub   = get_client_pub(name)
+    stats = peers.get(pub, {}) if pub else {}
+
+    hs = fmt_handshake(stats.get("handshake", 0))
+    rx = fmt_bytes(stats.get("rx", 0))
+    tx = fmt_bytes(stats.get("tx", 0))
+    ep = stats.get("endpoint", "—")
+
+    info = (
+        f"👤 Клиент: {name}\n\n"
+        f"🕐 Хендшейк: {hs}\n"
+        f"📍 Endpoint: {ep}\n"
+        f"📶 Трафик (с перезагрузки): ↓{rx} ↑{tx}"
+    )
     kb = [
         [InlineKeyboardButton("📄 Скачать .conf",    callback_data=f"conf_{name}")],
         [InlineKeyboardButton("📱 QR-код",            callback_data=f"qr_{name}")],
         [InlineKeyboardButton("📤 Поделиться кодом", callback_data=f"share_{name}")],
         [InlineKeyboardButton("◀️ Назад",             callback_data="list")],
     ]
-    await query.edit_message_text(f"👤 Клиент: {name}\n\nВыберите действие:", reply_markup=InlineKeyboardMarkup(kb))
+    await query.edit_message_text(info, reply_markup=InlineKeyboardMarkup(kb))
 
 async def send_conf(query, name):
     conf_path = f"{CLIENTS_DIR}/{name}.conf"
@@ -277,16 +386,99 @@ async def send_share(query, name):
         await query.message.reply_text(f"❌ Файл не найден для {name}")
         return
     code = open(p).read().strip()
-    # Отправляем текстом
     await query.message.reply_text(
         f"📤 Код для AmneziaVPN — {name}\n\nВставьте в приложении: + → Вставить ключ\n\n`{code}`",
         parse_mode="Markdown"
     )
-    # Отправляем как .vpn файл
     await query.message.reply_document(
         document=open(p, "rb"),
         filename=f"{name}.vpn",
-        caption=f"📁 Файл .vpn для импорта в AmneziaVPN\nФайл с настройками → выберите этот файл"
+        caption=f"📁 Файл .vpn для импорта в AmneziaVPN"
+    )
+
+# ── Статус сервера ─────────────────────────────────────────────────────────────
+async def show_status(query):
+    peers = get_awg_dump()
+    now   = int(time.time())
+
+    # Онлайн = handshake < 3 минут
+    online = sum(1 for p in peers.values() if p.get("handshake") and now - p["handshake"] < 180)
+    total  = len([p for p in peers.values() if p.get("allowed")])
+
+    try:
+        uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
+    except:
+        uptime = "—"
+
+    mem   = subprocess.check_output(["free", "-m"], text=True).split("\n")[1].split()
+    ram_used, ram_total = int(mem[2]), int(mem[1])
+    ram_pct = int(ram_used / ram_total * 100)
+
+    disk  = subprocess.check_output(["df", "-h", "/"], text=True).split("\n")[1].split()
+    disk_used, disk_total, disk_pct = disk[2], disk[1], disk[4]
+
+    load  = open("/proc/loadavg").read().split()[:3]
+    cpu_cores = os.cpu_count() or 1
+
+    try:
+        cpu = subprocess.check_output(["top", "-bn1"], text=True)
+        for line in cpu.split("\n"):
+            if "Cpu" in line:
+                idle = float(line.split("id")[0].split(",")[-1].strip().replace(",", "."))
+                cpu_pct = f"{100 - idle:.1f}%"
+                break
+        else:
+            cpu_pct = "—"
+    except:
+        cpu_pct = "—"
+
+    # Суммарный трафик с перезагрузки
+    total_rx = sum(p.get("rx", 0) for p in peers.values())
+    total_tx = sum(p.get("tx", 0) for p in peers.values())
+
+    text = (
+        f"📊 Статус сервера\n\n"
+        f"🟢 AWG: работает\n"
+        f"🖥 IP: {SERVER_IP}:{SERVER_PORT}\n"
+        f"⏱ Uptime: {uptime}\n\n"
+        f"💻 CPU: {cpu_pct} | Ядер: {cpu_cores}\n"
+        f"📈 Load: {load[0]} {load[1]} {load[2]}\n"
+        f"💾 RAM: {ram_used}/{ram_total} MB ({ram_pct}%)\n"
+        f"💿 Диск: {disk_used}/{disk_total} ({disk_pct})\n\n"
+        f"👤 Клиентов: {len(get_clients())}\n"
+        f"🟢 Онлайн: {online} / {total}\n"
+        f"📶 Трафик (с перезагрузки): ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}"
+    )
+    await query.edit_message_text(text, reply_markup=back_kb())
+
+# ── Очистка мусора ─────────────────────────────────────────────────────────────
+async def do_cleanup(query):
+    peers = get_awg_dump()
+    clients = get_clients()
+
+    # Собираем известные публичные ключи
+    known_pubs = set()
+    for name in clients:
+        pub = get_client_pub(name)
+        if pub:
+            known_pubs.add(pub)
+
+    # Находим мусорные пиры — нет в known_pubs
+    trash = [pub for pub in peers if pub not in known_pubs]
+
+    if not trash:
+        await query.edit_message_text("✅ Мусора нет — всё чисто!", reply_markup=back_kb())
+        return
+
+    removed = 0
+    for pub in trash:
+        result = subprocess.run(["awg", "set", AWG_IFACE, "peer", pub, "remove"])
+        if result.returncode == 0:
+            removed += 1
+
+    await query.edit_message_text(
+        f"🧹 Очистка завершена\n\nУдалено мусорных пиров: {removed}",
+        reply_markup=back_kb()
     )
 
 # ── Инструкция ────────────────────────────────────────────────────────────────
@@ -307,21 +499,6 @@ async def show_help(query):
         "• AmneziaVPN — с раздельным туннелированием\n\n"
         "Для подключения обратитесь к администратору."
     )
-    await query.edit_message_text(text, reply_markup=back_kb())
-
-# ── Статус ─────────────────────────────────────────────────────────────────────
-async def show_status(query):
-    output = awg_show()
-    peers  = output.count("peer:")
-    try:
-        uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
-    except:
-        uptime = "—"
-    mem = subprocess.check_output(["free", "-m"], text=True).split("\n")[1].split()
-    ram = f"{mem[2]} MB / {mem[1]} MB"
-    text = (f"📊 Статус сервера\n\n🟢 AWG: работает\n🖥 IP: {SERVER_IP}:{SERVER_PORT}\n"
-            f"⏱ Uptime: {uptime}\n💾 RAM: {ram}\n"
-            f"👤 Клиентов: {len(get_clients())}\n🔗 Активных пиров: {peers}")
     await query.edit_message_text(text, reply_markup=back_kb())
 
 # ── Удаление ───────────────────────────────────────────────────────────────────
@@ -362,7 +539,6 @@ async def confirm_delete(query, name):
             new_lines.append(line)
     with open(AWG_CONF, "w") as f:
         f.write("\n".join(new_lines))
-    # Удаляем все файлы клиента
     for ext in [".conf", ".vpn", ".vpnlink"]:
         p = f"{CLIENTS_DIR}/{name}{ext}"
         if os.path.exists(p):
@@ -374,19 +550,19 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    name = "".join(c for c in update.message.text.strip() if c.isalnum() or c in "_-")
+    name = "".join(c for c in update.message.text.strip() if c.isalnum() or c in "_-.")
     if not name:
-        await update.message.reply_text("❌ Имя пустое. Используйте латиницу, цифры, _ или -.")
+        await update.message.reply_text("❌ Имя пустое.")
         return ConversationHandler.END
     if os.path.exists(f"{CLIENTS_DIR}/{name}.conf"):
         await update.message.reply_text(f"❌ Клиент {name} уже существует.")
         return ConversationHandler.END
 
-    priv      = subprocess.check_output(["awg", "genkey"], text=True).strip()
-    pub       = subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
-    psk       = subprocess.check_output(["awg", "genpsk"], text=True).strip()
-    ip        = f"{VPN_SUBNET}.{next_ip()}"
-    obfs      = gen_obfs()
+    priv = subprocess.check_output(["awg", "genkey"], text=True).strip()
+    pub  = subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
+    psk  = subprocess.check_output(["awg", "genpsk"], text=True).strip()
+    ip   = f"{VPN_SUBNET}.{next_ip()}"
+    obfs = gen_obfs()
 
     with open(AWG_CONF, "a") as f:
         f.write(f"\n# Client: {name}\n[Peer]\nPublicKey = {pub}\nPresharedKey = {psk}\nAllowedIPs = {ip}/32\n")
@@ -396,7 +572,7 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     os.makedirs(CLIENTS_DIR, exist_ok=True)
     conf_path = f"{CLIENTS_DIR}/{name}.conf"
-    vpn_file  = f"{CLIENTS_DIR}/{name}{VPN_EXT}"
+    vpn_file  = f"{CLIENTS_DIR}/{name}.vpn"
 
     with open(conf_path, "w") as f:
         f.write(make_wg_conf(priv, ip, psk, obfs))
@@ -408,7 +584,6 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename=f"{name}.conf",
         caption=f"✅ Клиент {name} добавлен\n🌐 IP: {ip}"
     )
-
     qr_path = f"/tmp/{name}_qr.png"
     try:
         subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
@@ -435,7 +610,10 @@ def main():
         query = update.callback_query
         await query.answer()
         await query.edit_message_text(
-            "✏️ Введите имя клиента\n\nФормат: Имя.Устройство\nНапример: Lev.Phone, Artem.PC, Ivan.Nout\n\nКаждому устройству — свой профиль!"
+            "✏️ Введите имя клиента\n\n"
+            "Формат: Имя.Устройство\n"
+            "Например: Lev.Phone, Artem.PC, Ivan.Nout\n\n"
+            "Каждому устройству — свой профиль!"
         )
         return WAITING_NAME
 
@@ -450,7 +628,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info(f"Бот запущен. Admin ID: {ADMIN_ID}")
-    print(f"\n\033[0;32m✓ Бот запущен! Напишите /start вашему боту в Telegram.\033[0m\n")
+    print(f"\n\033[0;32m✓ Бот запущен!\033[0m\n")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
