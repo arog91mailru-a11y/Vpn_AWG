@@ -6,11 +6,15 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; NC='\033[0m'
-CONFIG_FILE  = "/etc/amnezia/amneziawg/bot.env"
-ENV_FILE     = "/etc/amnezia/amneziawg/server.env"
+CONFIG_FILE = "/etc/amnezia/amneziawg/bot.env"
+ENV_FILE    = "/etc/amnezia/amneziawg/server.env"
+USERS_FILE  = "/etc/amnezia/amneziawg/users.json"
+CLIENTS_DIR = "/etc/amnezia/amneziawg/clients"
+AWG_CONF    = "/etc/amnezia/amneziawg/awg0.conf"
 
+MAX_DEVICES = 10  # максимум устройств на одного пользователя
 
+# ── Конфиг ─────────────────────────────────────────────────────────────────────
 def load_env(path):
     env = {}
     with open(path) as f:
@@ -22,6 +26,7 @@ def load_env(path):
     return env
 
 def setup():
+    R='\033[0;31m'; G='\033[0;32m'; C='\033[0;36m'; B='\033[1m'; NC='\033[0m'
     print(f"\n{C}{B}{'='*50}{NC}")
     print(f"{C}{B}   AmneziaWG — Настройка Telegram бота{NC}")
     print(f"{C}{B}{'='*50}{NC}\n")
@@ -51,33 +56,67 @@ SERVER_PORT   = srv["SERVER_PORT"]
 SERVER_PUBLIC = srv["SERVER_PUBLIC"]
 VPN_SUBNET    = srv["VPN_SUBNET"]
 AWG_IFACE     = srv["VPN_IFACE"]
-CLIENTS_DIR   = "/etc/amnezia/amneziawg/clients"
-AWG_CONF      = "/etc/amnezia/amneziawg/awg0.conf"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
-WAITING_NAME = 1
 
-# ── Трафик ────────────────────────────────────────────────────────────────────
-def load_traffic():
+# Состояния ConversationHandler
+WAITING_REGISTER_NAME = 10
+WAITING_DEVICE_NAME   = 11
+
+# ── Пользователи ───────────────────────────────────────────────────────────────
+def load_users() -> dict:
+    """
+    Структура users.json:
+    {
+      "approved": {
+        "123456789": {"name": "Ivan", "display": "Иван"}
+      },
+      "pending": {
+        "987654321": {"name": "Lev", "display": "Lev", "requested_at": 1234567890}
+      }
+    }
+    """
     try:
-        return json.load(open(TRAFFIC_FILE))
+        return json.load(open(USERS_FILE))
     except:
-        return {}
+        return {"approved": {}, "pending": {}}
 
-def save_traffic(data):
-    json.dump(data, open(TRAFFIC_FILE, "w"), indent=2)
+def save_users(data: dict):
+    json.dump(data, open(USERS_FILE, "w"), indent=2, ensure_ascii=False)
 
-def get_awg_dump():
-    """Возвращает dict: pub_key -> {rx, tx, endpoint, handshake, allowed_ips}"""
+def is_approved(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    users = load_users()
+    return str(user_id) in users["approved"]
+
+def get_user_name(user_id: int) -> str:
+    """Возвращает латинское имя пользователя для префикса клиентов"""
+    if user_id == ADMIN_ID:
+        return "Admin"
+    users = load_users()
+    info = users["approved"].get(str(user_id), {})
+    return info.get("name", "User")
+
+def get_user_display(user_id: int) -> str:
+    """Возвращает отображаемое имя"""
+    if user_id == ADMIN_ID:
+        return "Admin"
+    users = load_users()
+    info = users["approved"].get(str(user_id), {})
+    return info.get("display", info.get("name", "User"))
+
+# ── AWG хелперы ────────────────────────────────────────────────────────────────
+def get_awg_dump() -> dict:
     try:
         out = subprocess.check_output(["awg", "show", AWG_IFACE, "dump"], text=True)
     except:
         return {}
     peers = {}
-    for line in out.strip().split("\n")[1:]:  # пропускаем первую строку (интерфейс)
+    for line in out.strip().split("\n")[1:]:
         parts = line.split("\t")
-        if len(parts) < 8:
+        if len(parts) < 7:
             continue
         pub       = parts[0]
         endpoint  = parts[2] if parts[2] != "(none)" else ""
@@ -89,78 +128,75 @@ def get_awg_dump():
                       "allowed": allowed, "handshake": handshake}
     return peers
 
-def accumulate_traffic():
-    """Вызывается из cron каждые 5 минут — накапливает трафик"""
-    data   = load_traffic()
-    peers  = get_awg_dump()
-    now    = datetime.now()
-    month  = now.strftime("%Y-%m")
+def next_ip() -> int:
+    i = 2
+    while True:
+        with open(AWG_CONF) as f:
+            if f"{VPN_SUBNET}.{i}/32" not in f.read():
+                return i
+        i += 1
 
-    # Сопоставляем пиры с клиентами по allowed_ips
-    client_map = {}  # pub -> name
-    for f in os.listdir(CLIENTS_DIR):
-        if not f.endswith(".conf"):
-            continue
-        name = f[:-5]
-        with open(f"{CLIENTS_DIR}/{f}") as cf:
-            for line in cf:
-                if line.startswith("PublicKey"):
-                    pub = line.split("=", 1)[1].strip()
-                    client_map[pub] = name
+def get_all_clients() -> list:
+    if not os.path.exists(CLIENTS_DIR):
+        return []
+    return sorted([f[:-5] for f in os.listdir(CLIENTS_DIR) if f.endswith(".conf")])
 
-    for pub, stats in peers.items():
-        name = client_map.get(pub, pub[:8])
-        if name not in data:
-            data[name] = {}
-        if month not in data[name]:
-            data[name][month] = {"rx": 0, "tx": 0, "last_rx": 0, "last_tx": 0}
+def get_user_clients(user_id: int) -> list:
+    """Клиенты конкретного пользователя — по префиксу имени"""
+    prefix = get_user_name(user_id) + "."
+    return [c for c in get_all_clients() if c.startswith(prefix)]
 
-        last_rx = data[name][month].get("last_rx", 0)
-        last_tx = data[name][month].get("last_tx", 0)
+def get_client_pub(name: str) -> str | None:
+    try:
+        with open(f"{CLIENTS_DIR}/{name}.conf") as f:
+            in_interface = False
+            for line in f:
+                line = line.strip()
+                if line == "[Interface]":
+                    in_interface = True
+                elif line.startswith("["):
+                    in_interface = False
+                elif in_interface and line.startswith("PrivateKey"):
+                    priv = line.split("=", 1)[1].strip()
+                    return subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
+    except:
+        pass
+    return None
 
-        # AWG счётчики растут, но могут сброситься при перезагрузке
-        if stats["rx"] >= last_rx:
-            data[name][month]["rx"] += stats["rx"] - last_rx
-        else:
-            data[name][month]["rx"] += stats["rx"]  # сброс счётчика
+def remove_client_from_awg(name: str):
+    """Удалить клиента из AWG и конфига"""
+    conf_path = f"{CLIENTS_DIR}/{name}.conf"
+    if not os.path.exists(conf_path):
+        return
+    # Удаляем пир из живого интерфейса
+    with open(conf_path) as f:
+        for line in f:
+            if line.startswith("PublicKey"):
+                pub = line.split("=", 1)[1].strip()
+                subprocess.run(["awg", "set", AWG_IFACE, "peer", pub, "remove"])
+                break
+    # Удаляем из awg0.conf
+    with open(AWG_CONF, encoding="utf-8", errors="replace") as f:
+        lines = f.read().split("\n")
+    new_lines, skip = [], False
+    for line in lines:
+        if line.strip() == f"# Client: {name}":
+            skip = True
+        elif skip and line.strip().startswith("[") and line.strip() != "[Peer]":
+            skip = False
+            new_lines.append(line)
+        elif not skip:
+            new_lines.append(line)
+    with open(AWG_CONF, "w") as f:
+        f.write("\n".join(new_lines))
+    # Удаляем файлы клиента
+    for ext in [".conf", ".vpn", ".vpnlink"]:
+        p = f"{CLIENTS_DIR}/{name}{ext}"
+        if os.path.exists(p):
+            os.remove(p)
 
-        if stats["tx"] >= last_tx:
-            data[name][month]["tx"] += stats["tx"] - last_tx
-        else:
-            data[name][month]["tx"] += stats["tx"]
-
-        data[name][month]["last_rx"] = stats["rx"]
-        data[name][month]["last_tx"] = stats["tx"]
-
-    save_traffic(data)
-
-def fmt_bytes(b):
-    if b < 1024:
-        return f"{b} B"
-    elif b < 1024**2:
-        return f"{b/1024:.1f} KB"
-    elif b < 1024**3:
-        return f"{b/1024**2:.1f} MB"
-    else:
-        return f"{b/1024**3:.2f} GB"
-
-def fmt_handshake(ts):
-    if not ts:
-        return "никогда"
-    diff = int(time.time()) - ts
-    if diff < 60:
-        return f"{diff} сек назад 🟢"
-    elif diff < 180:
-        return f"{diff//60} мин назад 🟢"
-    elif diff < 3600:
-        return f"{diff//60} мин назад"
-    elif diff < 86400:
-        return f"{diff//3600} ч назад"
-    else:
-        return f"{diff//86400} д назад"
-
-# ── Обфускация ─────────────────────────────────────────────────────────────────
-def gen_obfs():
+# ── Обфускация и генерация конфига ─────────────────────────────────────────────
+def gen_obfs() -> dict:
     return {
         "Jc":   srv.get("JC",   "4"),
         "Jmin": srv.get("JMIN", "40"),
@@ -173,9 +209,20 @@ def gen_obfs():
         "H4":   srv.get("H4",   "4"),
     }
 
-def make_vpn_link(priv, pub, ip, psk, obfs, name):
+def make_wg_conf(priv, ip, psk, obfs) -> str:
+    return "\n".join([
+        "[Interface]",
+        f"PrivateKey = {priv}", f"Address = {ip}/32", "DNS = 1.1.1.1",
+        f"Jc = {obfs['Jc']}", f"Jmin = {obfs['Jmin']}", f"Jmax = {obfs['Jmax']}",
+        f"S1 = {obfs['S1']}", f"S2 = {obfs['S2']}",
+        f"H1 = {obfs['H1']}", f"H2 = {obfs['H2']}", f"H3 = {obfs['H3']}", f"H4 = {obfs['H4']}",
+        "", "[Peer]", f"PublicKey = {SERVER_PUBLIC}", f"PresharedKey = {psk}",
+        f"Endpoint = {SERVER_IP}:{SERVER_PORT}", "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25",
+    ]) + "\n"
+
+def make_vpn_link(priv, pub, ip, psk, obfs, name) -> str:
     wg = (
-        f"[Interface]\nAddress = {ip}/32\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\n"
+        f"[Interface]\nAddress = {ip}/32\nDNS = 1.1.1.1\n"
         f"PrivateKey = {priv}\nJc = {obfs['Jc']}\nJmin = {obfs['Jmin']}\nJmax = {obfs['Jmax']}\n"
         f"S1 = {obfs['S1']}\nS2 = {obfs['S2']}\nH1 = {obfs['H1']}\nH2 = {obfs['H2']}\n"
         f"H3 = {obfs['H3']}\nH4 = {obfs['H4']}\n\n"
@@ -193,380 +240,11 @@ def make_vpn_link(priv, pub, ip, psk, obfs, name):
          "defaultContainer": "amnezia-awg", "description": name,
          "dns1": "1.1.1.1", "dns2": "1.0.0.1", "hostName": SERVER_IP, "nameOverriddenByUser": True}
     b = json.dumps(c, ensure_ascii=False).encode()
-    p = struct.pack('>I', len(b)) + zlib.compress(b)
-    return "vpn://" + base64.urlsafe_b64encode(p).decode().rstrip('=')
+    p = struct.pack(">I", len(b)) + zlib.compress(b)
+    return "vpn://" + base64.urlsafe_b64encode(p).decode().rstrip("=")
 
-def make_wg_conf(priv, ip, psk, obfs):
-    return "\n".join([
-        "[Interface]",
-        f"PrivateKey = {priv}", f"Address = {ip}/32", "DNS = 1.1.1.1",
-        f"Jc = {obfs['Jc']}", f"Jmin = {obfs['Jmin']}", f"Jmax = {obfs['Jmax']}",
-        f"S1 = {obfs['S1']}", f"S2 = {obfs['S2']}",
-        f"H1 = {obfs['H1']}", f"H2 = {obfs['H2']}", f"H3 = {obfs['H3']}", f"H4 = {obfs['H4']}",
-        "", "[Peer]", f"PublicKey = {SERVER_PUBLIC}", f"PresharedKey = {psk}",
-        f"Endpoint = {SERVER_IP}:{SERVER_PORT}", "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25",
-    ]) + "\n"
-
-# ── Хелперы ────────────────────────────────────────────────────────────────────
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID:
-            await update.effective_message.reply_text("⛔ Доступ запрещён.")
-            return
-        return await func(update, context)
-    return wrapper
-
-def next_ip():
-    i = 2
-    while True:
-        with open(AWG_CONF) as f:
-            if f"{VPN_SUBNET}.{i}/32" not in f.read():
-                return i
-        i += 1
-
-def get_clients():
-    if not os.path.exists(CLIENTS_DIR):
-        return []
-    return sorted([f[:-5] for f in os.listdir(CLIENTS_DIR) if f.endswith(".conf")])
-
-def get_client_pub(name):
-    """Получаем публичный ключ клиента из приватного ключа в [Interface]"""
-    try:
-        with open(f"{CLIENTS_DIR}/{name}.conf") as f:
-            in_interface = False
-            for line in f:
-                line = line.strip()
-                if line == "[Interface]":
-                    in_interface = True
-                elif line.startswith("["):
-                    in_interface = False
-                elif in_interface and line.startswith("PrivateKey"):
-                    priv = line.split("=", 1)[1].strip()
-                    pub = subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
-                    return pub
-    except:
-        pass
-    return None
-
-def awg_show():
-    try:
-        return subprocess.check_output(["awg", "show", AWG_IFACE], text=True)
-    except:
-        return ""
-
-def back_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ В меню", callback_data="back")]])
-
-def vpn_path(name):
-    p = f"{CLIENTS_DIR}/{name}.vpn"
-    if not os.path.exists(p):
-        alt = f"{CLIENTS_DIR}/{name}.vpnlink"
-        if os.path.exists(alt):
-            return alt
-    return p
-
-# ── Меню ───────────────────────────────────────────────────────────────────────
-async def main_menu_msg(msg, edit=False):
-    clients = get_clients()
-    kb = [
-        [InlineKeyboardButton("➕ Добавить клиента", callback_data="add")],
-        [InlineKeyboardButton("👥 Список клиентов",  callback_data="list")],
-        [InlineKeyboardButton("🗑 Удалить клиента",  callback_data="delete")],
-        [InlineKeyboardButton("📊 Статус сервера",   callback_data="status")],
-        [InlineKeyboardButton("🧹 Очистить мусор",   callback_data="cleanup")],
-        [InlineKeyboardButton("📋 Инструкция",       callback_data="help")],
-    ]
-    text = f"🔐 AmneziaWG — Управление VPN\n\n🖥 Сервер: {SERVER_IP}:{SERVER_PORT}\n👤 Клиентов: {len(clients)}"
-    if edit:
-        await msg.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-@admin_only
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await main_menu_msg(update.message)
-
-# ── Кнопки ─────────────────────────────────────────────────────────────────────
-@admin_only
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "back":
-        await main_menu_msg(query, edit=True)
-    elif data == "list":
-        await show_list(query)
-    elif data == "delete":
-        clients = get_clients()
-        if not clients:
-            await query.edit_message_text("👥 Клиентов нет.", reply_markup=back_kb())
-            return
-        kb = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"del_{n}")] for n in clients]
-        kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
-        await query.edit_message_text("Выберите клиента для удаления:", reply_markup=InlineKeyboardMarkup(kb))
-    elif data == "status":
-        await show_status(query)
-    elif data == "cleanup":
-        await do_cleanup(query)
-    elif data == "help":
-        await show_help(query)
-    elif data.startswith("del_"):
-        await do_delete(query, data[4:])
-    elif data.startswith("confirm_del_"):
-        await confirm_delete(query, data[12:])
-    elif data.startswith("client_"):
-        await show_client(query, data[7:])
-    elif data.startswith("conf_"):
-        await send_conf(query, data[5:])
-    elif data.startswith("qr_"):
-        await send_qr(query, data[3:])
-    elif data.startswith("share_"):
-        await send_share(query, data[6:])
-
-# ── Список клиентов ────────────────────────────────────────────────────────────
-async def show_list(query):
-    clients = get_clients()
-    if not clients:
-        await query.edit_message_text("👥 Клиентов нет.", reply_markup=back_kb())
-        return
-    peers = get_awg_dump()
-    lines = ["👥 Клиенты:\n"]
-    for name in clients:
-        pub   = get_client_pub(name)
-        stats = peers.get(pub, {}) if pub else {}
-        hs    = fmt_handshake(stats.get("handshake", 0))
-        rx    = fmt_bytes(stats.get("rx", 0))
-        tx    = fmt_bytes(stats.get("tx", 0))
-        lines.append(f"• {name} | {hs} | ↓{rx} ↑{tx}")
-
-    kb = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"client_{n}")] for n in clients]
-    kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
-
-async def show_client(query, name):
-    peers = get_awg_dump()
-    pub   = get_client_pub(name)
-    stats = peers.get(pub, {}) if pub else {}
-
-    hs = fmt_handshake(stats.get("handshake", 0))
-    rx = fmt_bytes(stats.get("rx", 0))
-    tx = fmt_bytes(stats.get("tx", 0))
-    ep = stats.get("endpoint", "—")
-
-    info = (
-        f"👤 Клиент: {name}\n\n"
-        f"🕐 Хендшейк: {hs}\n"
-        f"📍 Endpoint: {ep}\n"
-        f"📶 Трафик (с перезагрузки): ↓{rx} ↑{tx}"
-    )
-    kb = [
-        [InlineKeyboardButton("📄 Скачать .conf",    callback_data=f"conf_{name}")],
-        [InlineKeyboardButton("📱 QR-код",            callback_data=f"qr_{name}")],
-        [InlineKeyboardButton("📤 Поделиться кодом", callback_data=f"share_{name}")],
-        [InlineKeyboardButton("◀️ Назад",             callback_data="list")],
-    ]
-    await query.edit_message_text(info, reply_markup=InlineKeyboardMarkup(kb))
-
-async def send_conf(query, name):
-    conf_path = f"{CLIENTS_DIR}/{name}.conf"
-    await query.message.reply_document(
-        document=open(conf_path, "rb"),
-        filename=f"{name}.conf",
-        caption=f"📄 Конфиг клиента {name}"
-    )
-
-async def send_qr(query, name):
-    conf_path = f"{CLIENTS_DIR}/{name}.conf"
-    qr_path   = f"/tmp/{name}_qr.png"
-    try:
-        subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
-        await query.message.reply_photo(
-            photo=open(qr_path, "rb"),
-            caption=f"📱 QR для AmneziaWG\nКлиент: {name}"
-        )
-        os.remove(qr_path)
-    except Exception as e:
-        await query.message.reply_text(f"❌ Ошибка QR: {e}")
-
-async def send_share(query, name):
-    p = vpn_path(name)
-    if not os.path.exists(p):
-        await query.message.reply_text(f"❌ Файл не найден для {name}")
-        return
-    code = open(p).read().strip()
-    await query.message.reply_text(
-        f"📤 Код для AmneziaVPN — {name}\n\nВставьте в приложении: + → Вставить ключ\n\n`{code}`",
-        parse_mode="Markdown"
-    )
-    await query.message.reply_document(
-        document=open(p, "rb"),
-        filename=f"{name}.vpn",
-        caption=f"📁 Файл .vpn для импорта в AmneziaVPN"
-    )
-
-# ── Статус сервера ─────────────────────────────────────────────────────────────
-async def show_status(query):
-    peers = get_awg_dump()
-    now   = int(time.time())
-
-    # Онлайн = handshake < 3 минут
-    online = sum(1 for p in peers.values() if p.get("handshake") and now - p["handshake"] < 180)
-    total  = len([p for p in peers.values() if p.get("allowed")])
-
-    try:
-        uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
-    except:
-        uptime = "—"
-
-    mem   = subprocess.check_output(["free", "-m"], text=True).split("\n")[1].split()
-    ram_used, ram_total = int(mem[2]), int(mem[1])
-    ram_pct = int(ram_used / ram_total * 100)
-
-    disk  = subprocess.check_output(["df", "-h", "/"], text=True).split("\n")[1].split()
-    disk_used, disk_total, disk_pct = disk[2], disk[1], disk[4]
-
-    load  = open("/proc/loadavg").read().split()[:3]
-    cpu_cores = os.cpu_count() or 1
-
-    try:
-        cpu = subprocess.check_output(["top", "-bn1"], text=True)
-        for line in cpu.split("\n"):
-            if "Cpu" in line:
-                idle = float(line.split("id")[0].split(",")[-1].strip().replace(",", "."))
-                cpu_pct = f"{100 - idle:.1f}%"
-                break
-        else:
-            cpu_pct = "—"
-    except:
-        cpu_pct = "—"
-
-    # Суммарный трафик с перезагрузки
-    total_rx = sum(p.get("rx", 0) for p in peers.values())
-    total_tx = sum(p.get("tx", 0) for p in peers.values())
-
-    text = (
-        f"📊 Статус сервера\n\n"
-        f"🟢 AWG: работает\n"
-        f"🖥 IP: {SERVER_IP}:{SERVER_PORT}\n"
-        f"⏱ Uptime: {uptime}\n\n"
-        f"💻 CPU: {cpu_pct} | Ядер: {cpu_cores}\n"
-        f"📈 Load: {load[0]} {load[1]} {load[2]}\n"
-        f"💾 RAM: {ram_used}/{ram_total} MB ({ram_pct}%)\n"
-        f"💿 Диск: {disk_used}/{disk_total} ({disk_pct})\n\n"
-        f"👤 Клиентов: {len(get_clients())}\n"
-        f"🟢 Онлайн: {online} / {total}\n"
-        f"📶 Трафик (с перезагрузки): ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}"
-    )
-    await query.edit_message_text(text, reply_markup=back_kb())
-
-# ── Очистка мусора ─────────────────────────────────────────────────────────────
-async def do_cleanup(query):
-    peers = get_awg_dump()
-    clients = get_clients()
-
-    # Собираем известные публичные ключи
-    known_pubs = set()
-    for name in clients:
-        pub = get_client_pub(name)
-        if pub:
-            known_pubs.add(pub)
-
-    # Находим мусорные пиры — нет в known_pubs
-    trash = [pub for pub in peers if pub not in known_pubs]
-
-    if not trash:
-        await query.edit_message_text("✅ Мусора нет — всё чисто!", reply_markup=back_kb())
-        return
-
-    removed = 0
-    for pub in trash:
-        result = subprocess.run(["awg", "set", AWG_IFACE, "peer", pub, "remove"])
-        if result.returncode == 0:
-            removed += 1
-
-    await query.edit_message_text(
-        f"🧹 Очистка завершена\n\nУдалено мусорных пиров: {removed}",
-        reply_markup=back_kb()
-    )
-
-# ── Инструкция ────────────────────────────────────────────────────────────────
-async def show_help(query):
-    text = (
-        "📋 Инструкция по подключению\n\n"
-        "⚠️ Каждому устройству — свой профиль!\n"
-        "Нельзя использовать один конфиг на нескольких устройствах — "
-        "это вызовет конфликты и разрывы у всех.\n\n"
-        "📝 Правило именования:\n"
-        "Имя.Устройство через точку:\n"
-        "• Lev.Phone — телефон Льва\n"
-        "• Lev.PC — компьютер Льва\n"
-        "• Artem.Telefon — телефон Артёма\n"
-        "• Artem.Nout — ноутбук Артёма\n\n"
-        "📲 Приложения:\n"
-        "• AmneziaWG — простое подключение\n"
-        "• AmneziaVPN — с раздельным туннелированием\n\n"
-        "Для подключения обратитесь к администратору."
-    )
-    await query.edit_message_text(text, reply_markup=back_kb())
-
-# ── Удаление ───────────────────────────────────────────────────────────────────
-async def do_delete(query, name):
-    if not os.path.exists(f"{CLIENTS_DIR}/{name}.conf"):
-        await query.edit_message_text(f"❌ Клиент {name} не найден.", reply_markup=back_kb())
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{name}")],
-        [InlineKeyboardButton("❌ Отмена",      callback_data="delete")],
-    ])
-    await query.edit_message_text(
-        f"🗑 Удаление клиента {name}\n\nХорошо подумал? Это действие необратимо.",
-        reply_markup=kb
-    )
-
-async def confirm_delete(query, name):
-    conf_path = f"{CLIENTS_DIR}/{name}.conf"
-    if not os.path.exists(conf_path):
-        await query.edit_message_text(f"❌ Клиент {name} не найден.", reply_markup=back_kb())
-        return
-    with open(conf_path) as f:
-        for line in f:
-            if line.startswith("PublicKey"):
-                pub = line.split("=", 1)[1].strip()
-                subprocess.run(["awg", "set", AWG_IFACE, "peer", pub, "remove"])
-                break
-    with open(AWG_CONF, encoding='utf-8', errors='replace') as f:
-        lines = f.read().split("\n")
-    new_lines, skip = [], False
-    for line in lines:
-        if line.strip() == f"# Client: {name}":
-            skip = True
-        elif skip and line.strip().startswith("[") and line.strip() != "[Peer]":
-            skip = False
-            new_lines.append(line)
-        elif not skip:
-            new_lines.append(line)
-    with open(AWG_CONF, "w") as f:
-        f.write("\n".join(new_lines))
-    for ext in [".conf", ".vpn", ".vpnlink"]:
-        p = f"{CLIENTS_DIR}/{name}{ext}"
-        if os.path.exists(p):
-            os.remove(p)
-    await query.edit_message_text(f"✅ Клиент {name} удалён.", reply_markup=back_kb())
-
-# ── Добавление клиента ─────────────────────────────────────────────────────────
-async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-
-    name = "".join(c for c in update.message.text.strip() if c.isalnum() or c in "_-.")
-    if not name:
-        await update.message.reply_text("❌ Имя пустое.")
-        return ConversationHandler.END
-    if os.path.exists(f"{CLIENTS_DIR}/{name}.conf"):
-        await update.message.reply_text(f"❌ Клиент {name} уже существует.")
-        return ConversationHandler.END
-
+async def create_client(name: str, app, notify_chat_id: int = None):
+    """Создаёт клиента AWG и отправляет файлы в чат"""
     priv = subprocess.check_output(["awg", "genkey"], text=True).strip()
     pub  = subprocess.check_output(["awg", "pubkey"], input=priv, text=True).strip()
     psk  = subprocess.check_output(["awg", "genpsk"], text=True).strip()
@@ -588,56 +266,717 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(vpn_file, "w") as f:
         f.write(make_vpn_link(priv, pub, ip, psk, obfs, name))
 
-    await update.message.reply_document(
-        document=open(conf_path, "rb"),
-        filename=f"{name}.conf",
-        caption=f"✅ Клиент {name} добавлен\n🌐 IP: {ip}"
-    )
-    qr_path = f"/tmp/{name}_qr.png"
-    try:
-        subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
-        await update.message.reply_photo(
-            photo=open(qr_path, "rb"),
-            caption=f"📱 QR для AmneziaWG\nКлиент: {name}"
+    if notify_chat_id:
+        await app.bot.send_document(
+            chat_id=notify_chat_id,
+            document=open(conf_path, "rb"),
+            filename=f"{name}.conf",
+            caption=f"✅ Устройство *{name}* добавлено\n🌐 IP: `{ip}`",
+            parse_mode="Markdown"
         )
-        os.remove(qr_path)
+        qr_path = f"/tmp/{name}_qr.png"
+        try:
+            subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
+            await app.bot.send_photo(
+                chat_id=notify_chat_id,
+                photo=open(qr_path, "rb"),
+                caption=f"📱 QR для AmneziaWG — {name}"
+            )
+            os.remove(qr_path)
+        except:
+            pass
+
+# ── Форматирование ─────────────────────────────────────────────────────────────
+def fmt_bytes(b: int) -> str:
+    if b < 1024:        return f"{b} B"
+    elif b < 1024**2:   return f"{b/1024:.1f} KB"
+    elif b < 1024**3:   return f"{b/1024**2:.1f} MB"
+    else:               return f"{b/1024**3:.2f} GB"
+
+def fmt_handshake(ts: int) -> str:
+    if not ts: return "никогда"
+    diff = int(time.time()) - ts
+    if diff < 60:      return f"{diff} сек назад 🟢"
+    elif diff < 180:   return f"{diff//60} мин назад 🟢"
+    elif diff < 3600:  return f"{diff//60} мин назад"
+    elif diff < 86400: return f"{diff//3600} ч назад"
+    else:              return f"{diff//86400} д назад"
+
+def back_kb(target="back"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ В меню", callback_data=target)]])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# РЕГИСТРАЦИЯ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # Уже одобрен или админ
+    if is_approved(user_id):
+        await main_menu(update.message, user_id)
+        return ConversationHandler.END
+
+    # Уже ждёт одобрения
+    users = load_users()
+    if str(user_id) in users["pending"]:
+        await update.message.reply_text(
+            "⏳ Ваш запрос уже отправлен администратору.\n"
+            "Ожидайте подтверждения."
+        )
+        return ConversationHandler.END
+
+    # Новый пользователь — просим имя латиницей
+    await update.message.reply_text(
+        "👋 Добро пожаловать в семейный VPN!\n\n"
+        "Введите ваше имя *латиницей* (только буквы, без пробелов).\n"
+        "Именно оно будет использоваться для ваших устройств.\n\n"
+        "Например: `Ivan`, `Lev`, `Artem`, `Marina`",
+        parse_mode="Markdown"
+    )
+    return WAITING_REGISTER_NAME
+
+async def receive_register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id      = update.effective_user.id
+    tg_name      = update.effective_user.first_name or "Unknown"
+    raw          = update.message.text.strip()
+
+    # Оставляем только латиницу и цифры
+    latin_name = "".join(c for c in raw if c.isascii() and (c.isalpha() or c.isdigit()))
+    latin_name = latin_name.capitalize()
+
+    if not latin_name:
+        await update.message.reply_text(
+            "❌ Пожалуйста, введите имя *латиницей*. Например: `Ivan`",
+            parse_mode="Markdown"
+        )
+        return WAITING_REGISTER_NAME
+
+    # Проверяем что имя не занято другим пользователем
+    users = load_users()
+    taken = [u["name"].lower() for u in users["approved"].values()] + \
+            [u["name"].lower() for u in users["pending"].values()]
+    if latin_name.lower() in taken:
+        await update.message.reply_text(
+            f"❌ Имя *{latin_name}* уже занято. Попробуйте другое.",
+            parse_mode="Markdown"
+        )
+        return WAITING_REGISTER_NAME
+
+    # Сохраняем в pending
+    users["pending"][str(user_id)] = {
+        "name":         latin_name,
+        "display":      tg_name,
+        "requested_at": int(time.time())
+    }
+    save_users(users)
+
+    await update.message.reply_text(
+        f"✅ Запрос отправлен!\n\n"
+        f"Ваше имя в системе: *{latin_name}*\n"
+        f"Ожидайте подтверждения администратора.",
+        parse_mode="Markdown"
+    )
+
+    # Уведомляем администратора
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✅ Разрешить", callback_data=f"approve_{user_id}"),
+            InlineKeyboardButton(f"❌ Отклонить", callback_data=f"reject_{user_id}"),
+        ]
+    ])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"🔔 Новый запрос на доступ к VPN\n\n"
+            f"👤 Telegram: {tg_name} (@{update.effective_user.username or '—'})\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📝 Имя в системе: *{latin_name}*"
+        ),
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ГЛАВНОЕ МЕНЮ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def main_menu(msg, user_id: int, edit=False):
+    is_admin = (user_id == ADMIN_ID)
+
+    if is_admin:
+        clients_count = len(get_all_clients())
+        users         = load_users()
+        pending_count = len(users["pending"])
+        pending_label = f"👥 Пользователи" + (f" 🔴{pending_count}" if pending_count else "")
+        kb = [
+            [InlineKeyboardButton("➕ Добавить устройство",  callback_data="add")],
+            [InlineKeyboardButton("📋 Мои устройства",       callback_data="my_devices")],
+            [InlineKeyboardButton("🌍 Все клиенты",          callback_data="all_clients")],
+            [InlineKeyboardButton(pending_label,             callback_data="manage_users")],
+            [InlineKeyboardButton("📊 Статус сервера",       callback_data="status")],
+            [InlineKeyboardButton("🧹 Очистить мусор",       callback_data="cleanup")],
+        ]
+        text = (
+            f"🔐 AmneziaWG — Панель администратора\n\n"
+            f"🖥 Сервер: {SERVER_IP}:{SERVER_PORT}\n"
+            f"📱 Всего клиентов: {clients_count}\n"
+            f"👥 Пользователей: {len(users['approved'])}"
+            + (f"\n🔴 Ожидают одобрения: {pending_count}" if pending_count else "")
+        )
+    else:
+        my_clients    = get_user_clients(user_id)
+        display_name  = get_user_display(user_id)
+        kb = [
+            [InlineKeyboardButton("➕ Добавить устройство",  callback_data="add")],
+            [InlineKeyboardButton("📋 Мои устройства",       callback_data="my_devices")],
+            [InlineKeyboardButton("📖 Инструкция",           callback_data="help")],
+        ]
+        text = (
+            f"🔐 Семейный VPN\n\n"
+            f"👋 Привет, {display_name}!\n"
+            f"📱 Ваших устройств: {len(my_clients)} / {MAX_DEVICES}"
+        )
+
+    if edit:
+        await msg.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ОБРАБОТЧИК КНОПОК
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data = query.data
+
+    # Одобрение/отклонение — только для админа
+    if data.startswith("approve_") or data.startswith("reject_"):
+        if user_id != ADMIN_ID:
+            await query.answer("⛔ Только для администратора", show_alert=True)
+            return
+        target_id = int(data.split("_", 1)[1])
+        users = load_users()
+        info  = users["pending"].get(str(target_id))
+        if not info:
+            await query.edit_message_text("⚠️ Запрос уже обработан.")
+            return
+        if data.startswith("approve_"):
+            users["approved"][str(target_id)] = info
+            del users["pending"][str(target_id)]
+            save_users(users)
+            await query.edit_message_text(
+                f"✅ Пользователь *{info['name']}* ({info['display']}) одобрен.",
+                parse_mode="Markdown"
+            )
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"🎉 Доступ к VPN открыт!\n\n"
+                    f"Ваше имя в системе: *{info['name']}*\n\n"
+                    f"Нажмите /start чтобы начать."
+                ),
+                parse_mode="Markdown"
+            )
+        else:
+            del users["pending"][str(target_id)]
+            save_users(users)
+            await query.edit_message_text(
+                f"❌ Пользователь *{info['name']}* ({info['display']}) отклонён.",
+                parse_mode="Markdown"
+            )
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="❌ Ваш запрос на доступ к VPN отклонён администратором."
+            )
+        return
+
+    # Все остальные кнопки — только для одобренных
+    if not is_approved(user_id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
+
+    is_admin = (user_id == ADMIN_ID)
+
+    if data == "back":
+        await main_menu(query, user_id, edit=True)
+
+    elif data == "my_devices":
+        await show_my_devices(query, user_id)
+
+    elif data == "all_clients" and is_admin:
+        await show_all_clients(query)
+
+    elif data == "manage_users" and is_admin:
+        await show_manage_users(query)
+
+    elif data == "status" and is_admin:
+        await show_status(query)
+
+    elif data == "cleanup" and is_admin:
+        await do_cleanup(query)
+
+    elif data == "help":
+        await show_help(query)
+
+    elif data.startswith("device_"):
+        await show_device(query, data[7:], user_id)
+
+    elif data.startswith("conf_"):
+        await send_conf(query, data[5:])
+
+    elif data.startswith("qr_"):
+        await send_qr(query, data[3:])
+
+    elif data.startswith("share_"):
+        await send_share(query, data[6:])
+
+    elif data.startswith("del_"):
+        await do_delete(query, data[4:], user_id)
+
+    elif data.startswith("confirm_del_"):
+        await confirm_delete(query, data[12:], user_id)
+
+    elif data.startswith("kick_user_") and is_admin:
+        await do_kick_user(query, int(data[10:]))
+
+    elif data.startswith("confirm_kick_") and is_admin:
+        await confirm_kick_user(query, int(data[13:]))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# МОИ УСТРОЙСТВА
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def show_my_devices(query, user_id: int):
+    clients = get_user_clients(user_id)
+    peers   = get_awg_dump()
+
+    if not clients:
+        kb = [
+            [InlineKeyboardButton("➕ Добавить первое устройство", callback_data="add")],
+            [InlineKeyboardButton("◀️ В меню", callback_data="back")],
+        ]
+        await query.edit_message_text(
+            "📱 У вас пока нет устройств.\nДобавьте первое!",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
+    lines = [f"📱 Ваши устройства ({len(clients)}/{MAX_DEVICES}):\n"]
+    for name in clients:
+        pub   = get_client_pub(name)
+        stats = peers.get(pub, {}) if pub else {}
+        hs    = fmt_handshake(stats.get("handshake", 0))
+        rx    = fmt_bytes(stats.get("rx", 0))
+        tx    = fmt_bytes(stats.get("tx", 0))
+        # Показываем только часть после точки (Имя.Устройство → Устройство)
+        short = name.split(".", 1)[1] if "." in name else name
+        lines.append(f"• {short} | {hs} | ↓{rx} ↑{tx}")
+
+    kb = [[InlineKeyboardButton(f"📋 {name.split('.', 1)[1] if '.' in name else name}",
+           callback_data=f"device_{name}")] for name in clients]
+    kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_device(query, name: str, user_id: int):
+    # Проверяем что устройство принадлежит пользователю (или это админ)
+    user_prefix = get_user_name(user_id) + "."
+    if user_id != ADMIN_ID and not name.startswith(user_prefix):
+        await query.answer("⛔ Это не ваше устройство.", show_alert=True)
+        return
+
+    peers = get_awg_dump()
+    pub   = get_client_pub(name)
+    stats = peers.get(pub, {}) if pub else {}
+
+    short = name.split(".", 1)[1] if "." in name else name
+    hs    = fmt_handshake(stats.get("handshake", 0))
+    rx    = fmt_bytes(stats.get("rx", 0))
+    tx    = fmt_bytes(stats.get("tx", 0))
+    ep    = stats.get("endpoint", "—")
+
+    info = (
+        f"📱 Устройство: *{short}*\n"
+        f"👤 Пользователь: {name.split('.')[0]}\n\n"
+        f"🕐 Хендшейк: {hs}\n"
+        f"📍 Endpoint: {ep}\n"
+        f"📶 Трафик: ↓{rx} ↑{tx}"
+    )
+    back_target = "my_devices" if user_id != ADMIN_ID else "all_clients"
+    kb = [
+        [InlineKeyboardButton("📄 Скачать .conf",    callback_data=f"conf_{name}")],
+        [InlineKeyboardButton("📱 QR-код",            callback_data=f"qr_{name}")],
+        [InlineKeyboardButton("📤 Поделиться кодом", callback_data=f"share_{name}")],
+        [InlineKeyboardButton("🗑 Удалить",           callback_data=f"del_{name}")],
+        [InlineKeyboardButton("◀️ Назад",             callback_data=back_target)],
+    ]
+    await query.edit_message_text(info, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: ВСЕ КЛИЕНТЫ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def show_all_clients(query):
+    clients = get_all_clients()
+    peers   = get_awg_dump()
+
+    if not clients:
+        await query.edit_message_text("👥 Клиентов нет.", reply_markup=back_kb())
+        return
+
+    lines = [f"🌍 Все клиенты ({len(clients)}):\n"]
+    for name in clients:
+        pub   = get_client_pub(name)
+        stats = peers.get(pub, {}) if pub else {}
+        hs    = fmt_handshake(stats.get("handshake", 0))
+        rx    = fmt_bytes(stats.get("rx", 0))
+        tx    = fmt_bytes(stats.get("tx", 0))
+        lines.append(f"• {name} | {hs} | ↓{rx} ↑{tx}")
+
+    kb = [[InlineKeyboardButton(f"📋 {name}", callback_data=f"device_{name}")] for name in clients]
+    kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def show_manage_users(query):
+    users = load_users()
+    lines = ["👥 Пользователи:\n"]
+
+    if users["pending"]:
+        lines.append("⏳ Ожидают одобрения:")
+        for uid, info in users["pending"].items():
+            lines.append(f"  • {info['name']} ({info['display']}) — ID: {uid}")
+        lines.append("")
+
+    if users["approved"]:
+        lines.append("✅ Одобренные:")
+        for uid, info in users["approved"].items():
+            count = len(get_user_clients(int(uid)))
+            lines.append(f"  • {info['name']} ({info['display']}) — {count} уст.")
+    else:
+        lines.append("✅ Одобренных пользователей пока нет.")
+
+    kb = []
+    # Кнопки для pending
+    for uid, info in users["pending"].items():
+        kb.append([
+            InlineKeyboardButton(f"✅ {info['name']}", callback_data=f"approve_{uid}"),
+            InlineKeyboardButton(f"❌ {info['name']}", callback_data=f"reject_{uid}"),
+        ])
+    # Кнопки для kick одобренных
+    for uid, info in users["approved"].items():
+        kb.append([InlineKeyboardButton(f"🚫 Удалить {info['name']}", callback_data=f"kick_user_{uid}")])
+
+    kb.append([InlineKeyboardButton("◀️ В меню", callback_data="back")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+async def do_kick_user(query, target_id: int):
+    users = load_users()
+    info  = users["approved"].get(str(target_id))
+    if not info:
+        await query.edit_message_text("⚠️ Пользователь не найден.", reply_markup=back_kb())
+        return
+    count = len(get_user_clients(target_id))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить всё", callback_data=f"confirm_kick_{target_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="manage_users")],
+    ])
+    await query.edit_message_text(
+        f"🚫 Удаление пользователя *{info['name']}*\n\n"
+        f"Будут удалены все его устройства: {count} шт.\n"
+        f"Действие необратимо!",
+        reply_markup=kb, parse_mode="Markdown"
+    )
+
+async def confirm_kick_user(query, target_id: int):
+    users = load_users()
+    info  = users["approved"].get(str(target_id))
+    if not info:
+        await query.edit_message_text("⚠️ Пользователь не найден.", reply_markup=back_kb())
+        return
+
+    # Удаляем все устройства пользователя
+    for name in get_user_clients(target_id):
+        remove_client_from_awg(name)
+
+    del users["approved"][str(target_id)]
+    save_users(users)
+
+    try:
+        await query.bot.send_message(
+            chat_id=target_id,
+            text="⛔ Ваш доступ к VPN был отозван администратором."
+        )
     except:
         pass
 
-    await main_menu_msg(update.message)
+    await query.edit_message_text(
+        f"✅ Пользователь *{info['name']}* удалён со всеми устройствами.",
+        reply_markup=back_kb("manage_users"), parse_mode="Markdown"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ОТПРАВКА ФАЙЛОВ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_conf(query, name: str):
+    conf_path = f"{CLIENTS_DIR}/{name}.conf"
+    short = name.split(".", 1)[1] if "." in name else name
+    await query.message.reply_document(
+        document=open(conf_path, "rb"),
+        filename=f"{name}.conf",
+        caption=f"📄 Конфиг устройства *{short}*",
+        parse_mode="Markdown"
+    )
+
+async def send_qr(query, name: str):
+    conf_path = f"{CLIENTS_DIR}/{name}.conf"
+    qr_path   = f"/tmp/{name}_qr.png"
+    short = name.split(".", 1)[1] if "." in name else name
+    try:
+        subprocess.run(["qrencode", "-o", qr_path, "-r", conf_path], check=True)
+        await query.message.reply_photo(
+            photo=open(qr_path, "rb"),
+            caption=f"📱 QR для AmneziaWG — *{short}*",
+            parse_mode="Markdown"
+        )
+        os.remove(qr_path)
+    except Exception as e:
+        await query.message.reply_text(f"❌ Ошибка QR: {e}")
+
+async def send_share(query, name: str):
+    vpn_path = f"{CLIENTS_DIR}/{name}.vpn"
+    if not os.path.exists(vpn_path):
+        vpn_path = f"{CLIENTS_DIR}/{name}.vpnlink"
+    if not os.path.exists(vpn_path):
+        await query.message.reply_text(f"❌ vpn-файл не найден для {name}")
+        return
+    short = name.split(".", 1)[1] if "." in name else name
+    code  = open(vpn_path).read().strip()
+    await query.message.reply_text(
+        f"📤 Код для AmneziaVPN — *{short}*\n\nВставьте в приложении: + → Вставить ключ\n\n`{code}`",
+        parse_mode="Markdown"
+    )
+    await query.message.reply_document(
+        document=open(vpn_path, "rb"),
+        filename=f"{name}.vpn",
+        caption=f"📁 Файл .vpn для AmneziaVPN"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# УДАЛЕНИЕ УСТРОЙСТВА
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def do_delete(query, name: str, user_id: int):
+    # Проверяем права
+    user_prefix = get_user_name(user_id) + "."
+    if user_id != ADMIN_ID and not name.startswith(user_prefix):
+        await query.answer("⛔ Это не ваше устройство.", show_alert=True)
+        return
+
+    if not os.path.exists(f"{CLIENTS_DIR}/{name}.conf"):
+        await query.edit_message_text("❌ Устройство не найдено.", reply_markup=back_kb())
+        return
+
+    short = name.split(".", 1)[1] if "." in name else name
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{name}")],
+        [InlineKeyboardButton("❌ Отмена",      callback_data=f"device_{name}")],
+    ])
+    await query.edit_message_text(
+        f"🗑 Удалить устройство *{short}*?\n\nЭто действие необратимо.",
+        reply_markup=kb, parse_mode="Markdown"
+    )
+
+async def confirm_delete(query, name: str, user_id: int):
+    user_prefix = get_user_name(user_id) + "."
+    if user_id != ADMIN_ID and not name.startswith(user_prefix):
+        await query.answer("⛔ Это не ваше устройство.", show_alert=True)
+        return
+
+    remove_client_from_awg(name)
+    short = name.split(".", 1)[1] if "." in name else name
+    await query.edit_message_text(
+        f"✅ Устройство *{short}* удалено.",
+        reply_markup=back_kb("my_devices"), parse_mode="Markdown"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# СТАТУС, ОЧИСТКА, ИНСТРУКЦИЯ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def show_status(query):
+    peers = get_awg_dump()
+    now   = int(time.time())
+    online = sum(1 for p in peers.values() if p.get("handshake") and now - p["handshake"] < 180)
+
+    try:    uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
+    except: uptime = "—"
+
+    mem       = subprocess.check_output(["free", "-m"], text=True).split("\n")[1].split()
+    ram_used  = int(mem[2]); ram_total = int(mem[1])
+    disk      = subprocess.check_output(["df", "-h", "/"], text=True).split("\n")[1].split()
+    load      = open("/proc/loadavg").read().split()[:3]
+    total_rx  = sum(p.get("rx", 0) for p in peers.values())
+    total_tx  = sum(p.get("tx", 0) for p in peers.values())
+    users     = load_users()
+
+    text = (
+        f"📊 Статус сервера\n\n"
+        f"🟢 AWG: работает\n"
+        f"🖥 IP: {SERVER_IP}:{SERVER_PORT}\n"
+        f"⏱ Uptime: {uptime}\n\n"
+        f"📈 Load: {load[0]} {load[1]} {load[2]}\n"
+        f"💾 RAM: {ram_used}/{ram_total} MB\n"
+        f"💿 Диск: {disk[2]}/{disk[1]} ({disk[4]})\n\n"
+        f"👤 Клиентов: {len(get_all_clients())}\n"
+        f"👥 Пользователей: {len(users['approved'])}\n"
+        f"🟢 Онлайн: {online}\n"
+        f"📶 Трафик (с перезагрузки): ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}"
+    )
+    await query.edit_message_text(text, reply_markup=back_kb())
+
+async def do_cleanup(query):
+    peers      = get_awg_dump()
+    known_pubs = {get_client_pub(n) for n in get_all_clients()} - {None}
+    trash      = [pub for pub in peers if pub not in known_pubs]
+
+    if not trash:
+        await query.edit_message_text("✅ Мусора нет — всё чисто!", reply_markup=back_kb())
+        return
+
+    removed = sum(
+        1 for pub in trash
+        if subprocess.run(["awg", "set", AWG_IFACE, "peer", pub, "remove"]).returncode == 0
+    )
+    await query.edit_message_text(
+        f"🧹 Очистка завершена\n\nУдалено мусорных пиров: {removed}",
+        reply_markup=back_kb()
+    )
+
+async def show_help(query):
+    text = (
+        "📖 Инструкция по подключению\n\n"
+        "⚠️ *Каждому устройству — свой профиль!*\n"
+        "Нельзя использовать один конфиг на нескольких устройствах.\n\n"
+        "📲 *Как подключиться:*\n"
+        "1. Нажмите «Добавить устройство»\n"
+        "2. Введите название: `Phone`, `PC`, `Nout`, `iPad`\n"
+        "3. Получите .conf файл и QR-код\n"
+        "4. Откройте AmneziaWG → импортируйте\n\n"
+        "📱 *Приложения:*\n"
+        "• AmneziaWG — простое подключение\n"
+        "• AmneziaVPN — с раздельным туннелированием"
+    )
+    await query.edit_message_text(text, reply_markup=back_kb(), parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ДОБАВЛЕНИЕ УСТРОЙСТВА (ConversationHandler)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def add_device_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    if not is_approved(user_id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return ConversationHandler.END
+
+    my_clients = get_user_clients(user_id)
+    if len(my_clients) >= MAX_DEVICES:
+        await query.edit_message_text(
+            f"❌ Достигнут лимит устройств ({MAX_DEVICES}).\n"
+            f"Удалите ненужные устройства.",
+            reply_markup=back_kb()
+        )
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        f"➕ Добавление устройства\n\n"
+        f"Введите название устройства *латиницей*:\n"
+        f"`Phone`, `PC`, `Nout`, `iPad`, `TV`",
+        parse_mode="Markdown"
+    )
+    context.user_data["adding_user_id"] = user_id
+    return WAITING_DEVICE_NAME
+
+async def receive_device_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_approved(user_id):
+        return ConversationHandler.END
+
+    raw        = update.message.text.strip()
+    device_raw = "".join(c for c in raw if c.isascii() and (c.isalnum() or c in "_-"))
+    device_raw = device_raw.capitalize()
+
+    if not device_raw:
+        await update.message.reply_text(
+            "❌ Введите название *латиницей*. Например: `Phone`",
+            parse_mode="Markdown"
+        )
+        return WAITING_DEVICE_NAME
+
+    user_name = get_user_name(user_id)
+    full_name = f"{user_name}.{device_raw}"
+
+    if os.path.exists(f"{CLIENTS_DIR}/{full_name}.conf"):
+        await update.message.reply_text(
+            f"❌ Устройство *{full_name}* уже существует. Введите другое название.",
+            parse_mode="Markdown"
+        )
+        return WAITING_DEVICE_NAME
+
+    await update.message.reply_text(f"⏳ Создаю профиль *{full_name}*...", parse_mode="Markdown")
+    await create_client(full_name, context.application, notify_chat_id=update.effective_chat.id)
+    await main_menu(update.message, user_id)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
-# ── Запуск ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ══════════════════════════════════════════════════════════════════════════════
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    async def add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            "✏️ Введите имя клиента\n\n"
-            "Формат: Имя.Устройство\n"
-            "Например: Lev.Phone, Artem.PC, Ivan.Nout\n\n"
-            "Каждому устройству — свой профиль!"
-        )
-        return WAITING_NAME
-
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_entry, pattern="^add$")],
-        states={WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)]},
+    # ConversationHandler — регистрация нового пользователя
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            WAITING_REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_register_name)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
+    # ConversationHandler — добавление устройства
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_device_entry, pattern="^add$")],
+        states={
+            WAITING_DEVICE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_device_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=True,
+    )
+
+    app.add_handler(reg_conv)
+    app.add_handler(add_conv)
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info(f"Бот запущен. Admin ID: {ADMIN_ID}")
-    print(f"\n\033[0;32m✓ Бот запущен!\033[0m\n")
+    print(f"\n\033[0;32m✓ Бот запущен! Admin ID: {ADMIN_ID}\033[0m\n")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
