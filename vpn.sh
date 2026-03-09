@@ -11,10 +11,14 @@ CLIENTS_DIR="/etc/amnezia/amneziawg/clients"
 ENV_FILE="/etc/amnezia/amneziawg/server.env"
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}Запускать от root: sudo bash vpn.sh${NC}" && exit 1
-[[ ! -f "$ENV_FILE" ]] && echo -e "${RED}Сначала запустите install.sh${NC}" && exit 1
+[[ ! -f "$ENV_FILE" ]] && echo -e "${RED}Сначала запустите setup.sh${NC}" && exit 1
 
 source "$ENV_FILE"
 mkdir -p "$CLIENTS_DIR"
+
+# DNS из server.env с дефолтами
+PRIMARY_DNS="${PRIMARY_DNS:-1.1.1.1}"
+SECONDARY_DNS="${SECONDARY_DNS:-1.0.0.1}"
 
 next_ip() {
     local i=2
@@ -35,15 +39,15 @@ show_header() {
 
 show_qr() {
     local NAME="$1"
-    local VPNLINK="$CLIENTS_DIR/${NAME}.vpnlink"
-    if [[ ! -f "$VPNLINK" ]]; then
+    local VPN_FILE="$CLIENTS_DIR/${NAME}.vpn"
+    if [[ ! -f "$VPN_FILE" ]]; then
         echo -e "${RED}vpn:// ссылка не найдена для ${NAME}${NC}"
         return
     fi
     if command -v qrencode &>/dev/null; then
         echo -e "${CYAN}QR-код (сканировать через AmneziaVPN):${NC}"
         echo ""
-        qrencode -t ansiutf8 -l L -r "$VPNLINK"
+        qrencode -t ansiutf8 -l L -r "$VPN_FILE"
         echo ""
     fi
 }
@@ -55,6 +59,7 @@ add_client() {
     echo ""
     read -p "Имя клиента (только латиница): " NAME
 
+    # Очищаем имя от кириллицы, пробелов и спецсимволов
     NAME=$(echo "$NAME" | tr -d '\r\xef\xbb\xbf' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | tr -cd '[:alnum:]_-')
 
     [[ -z "$NAME" ]] && echo -e "${RED}Имя пустое. Используйте только латиницу, цифры, _ или -.${NC}" && sleep 3 && return
@@ -65,16 +70,16 @@ add_client() {
     CLIENT_PSK=$(awg genpsk)
     CLIENT_IP="${VPN_SUBNET}.$(next_ip)"
 
-    # Случайные параметры обфускации
-    JC=$((RANDOM % 8 + 3))
-    JMIN=$((RANDOM % 41 + 10))
-    JMAX=$((RANDOM % 51 + 50))
-    S1=$((RANDOM % 81 + 20))
-    S2=$((RANDOM % 81 + 20))
-    H1=$((RANDOM % 1900000000 + 100000000))
-    H2=$((RANDOM % 1900000000 + 100000000))
-    H3=$((RANDOM % 1900000000 + 100000000))
-    H4=$((RANDOM % 1900000000 + 100000000))
+    # Используем параметры обфускации с сервера
+    JC_CLIENT="${JC}"
+    JMIN_CLIENT="${JMIN}"
+    JMAX_CLIENT="${JMAX}"
+    S1_CLIENT="${S1}"
+    S2_CLIENT="${S2}"
+    H1_CLIENT="${H1}"
+    H2_CLIENT="${H2}"
+    H3_CLIENT="${H3}"
+    H4_CLIENT="${H4}"
 
     printf "\n# Client: %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n" \
         "$NAME" "$CLIENT_PUBLIC" "$CLIENT_PSK" "$CLIENT_IP" >> "$AWG_CONF"
@@ -86,10 +91,10 @@ add_client() {
         printf "[Interface]\n"
         printf "PrivateKey = %s\n" "$CLIENT_PRIVATE"
         printf "Address = %s/32\n" "$CLIENT_IP"
-        printf "DNS = 1.1.1.1\n"
-        printf "Jc = %s\nJmin = %s\nJmax = %s\n" "$JC" "$JMIN" "$JMAX"
-        printf "S1 = %s\nS2 = %s\n" "$S1" "$S2"
-        printf "H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n" "$H1" "$H2" "$H3" "$H4"
+        printf "DNS = %s, %s\n" "$PRIMARY_DNS" "$SECONDARY_DNS"
+        printf "Jc = %s\nJmin = %s\nJmax = %s\n" "$JC_CLIENT" "$JMIN_CLIENT" "$JMAX_CLIENT"
+        printf "S1 = %s\nS2 = %s\n" "$S1_CLIENT" "$S2_CLIENT"
+        printf "H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n" "$H1_CLIENT" "$H2_CLIENT" "$H3_CLIENT" "$H4_CLIENT"
         printf "\n[Peer]\n"
         printf "PublicKey = %s\n" "$SERVER_PUBLIC"
         printf "PresharedKey = %s\n" "$CLIENT_PSK"
@@ -98,15 +103,17 @@ add_client() {
         printf "PersistentKeepalive = 25\n"
     } > "$CLIENTS_DIR/${NAME}.conf"
 
-    # Генерируем vpn:// ссылку для AmneziaVPN
+    # Генерируем vpn:// ссылку для AmneziaVPN — сохраняем в .vpn
     python3 - "$NAME" "$CLIENT_PRIVATE" "$CLIENT_PUBLIC" "$CLIENT_IP" "$CLIENT_PSK" \
-        "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$H1" "$H2" "$H3" "$H4" \
+        "$JC_CLIENT" "$JMIN_CLIENT" "$JMAX_CLIENT" "$S1_CLIENT" "$S2_CLIENT" \
+        "$H1_CLIENT" "$H2_CLIENT" "$H3_CLIENT" "$H4_CLIENT" \
         "$SERVER_PUBLIC" "$SERVER_IP" "$SERVER_PORT" \
-        "$CLIENTS_DIR/${NAME}.vpnlink" << 'PYEOF'
+        "$PRIMARY_DNS" "$SECONDARY_DNS" \
+        "$CLIENTS_DIR/${NAME}.vpn" << 'PYEOF'
 import sys, json, zlib, base64, struct
-name,priv,pub,ip,psk,jc,jmin,jmax,s1,s2,h1,h2,h3,h4,srv_pub,srv_ip,srv_port,out = sys.argv[1:]
+name,priv,pub,ip,psk,jc,jmin,jmax,s1,s2,h1,h2,h3,h4,srv_pub,srv_ip,srv_port,dns1,dns2,out = sys.argv[1:]
 obfs = {"Jc":jc,"Jmin":jmin,"Jmax":jmax,"S1":s1,"S2":s2,"H1":h1,"H2":h2,"H3":h3,"H4":h4}
-wg = (f"[Interface]\nAddress = {ip}/32\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\n"
+wg = (f"[Interface]\nAddress = {ip}/32\nDNS = {dns1}, {dns2}\n"
       f"PrivateKey = {priv}\nJc = {jc}\nJmin = {jmin}\nJmax = {jmax}\n"
       f"S1 = {s1}\nS2 = {s2}\nH1 = {h1}\nH2 = {h2}\nH3 = {h3}\nH4 = {h4}\n\n"
       f"[Peer]\nPublicKey = {srv_pub}\nPresharedKey = {psk}\n"
@@ -117,7 +124,7 @@ lc = {**obfs,"allowed_ips":["0.0.0.0/0","::/0"],"clientId":pub,"client_ip":ip,
 c = {"containers":[{"awg":{**obfs,"last_config":json.dumps(lc,indent=4),
      "port":srv_port,"subnet_address":".".join(ip.split(".")[:3])+".0","transport_proto":"udp"},
      "container":"amnezia-awg"}],"defaultContainer":"amnezia-awg","description":name,
-     "dns1":"1.1.1.1","dns2":"1.0.0.1","hostName":srv_ip,"nameOverriddenByUser":True}
+     "dns1":dns1,"dns2":dns2,"hostName":srv_ip,"nameOverriddenByUser":True}
 b = json.dumps(c,ensure_ascii=False).encode()
 p = struct.pack('>I',len(b)) + zlib.compress(b)
 open(out,'w').write('vpn://' + base64.urlsafe_b64encode(p).decode().rstrip('='))
@@ -125,6 +132,7 @@ PYEOF
 
     echo ""
     echo -e "${GREEN}✓ Клиент '${NAME}' добавлен — IP: ${CLIENT_IP}${NC}"
+    echo -e "${GREEN}  DNS: ${PRIMARY_DNS}, ${SECONDARY_DNS}${NC}"
     echo ""
     show_qr "$NAME"
     echo -e "${CYAN}Конфиг:${NC} ${CLIENTS_DIR}/${NAME}.conf"
@@ -166,7 +174,8 @@ list_clients() {
     for CONF in "$CLIENTS_DIR"/*.conf; do
         NAME=$(basename "$CONF" .conf)
         CLIENT_IP=$(grep "^Address" "$CONF" | awk '{print $3}' | cut -d'/' -f1)
-        CLIENT_PUBLIC=$(grep "^PublicKey" "$CONF" | awk '{print $3}')
+        # PublicKey берём из секции [Peer] клиентского конфига
+        CLIENT_PUBLIC=$(awk '/^\[Peer\]/{p=1} p && /^PublicKey/{print $3; exit}' "$CONF")
 
         HANDSHAKE=$(echo "$AWG_OUTPUT" | grep -A5 "$CLIENT_PUBLIC" | grep "latest handshake" | sed 's/.*latest handshake: //' || true)
         TRANSFER=$(echo "$AWG_OUTPUT" | grep -A5 "$CLIENT_PUBLIC" | grep "transfer" | sed 's/.*transfer: //' || true)
@@ -255,18 +264,22 @@ delete_client() {
 
     NAME="${NAMES[$((NUM-1))]}"
     CONF="$CLIENTS_DIR/${NAME}.conf"
-    CLIENT_PUBLIC=$(grep "^PublicKey" "$CONF" | awk '{print $3}')
+
+    # Берём PublicKey из секции [Peer] клиентского конфига
+    CLIENT_PUBLIC=$(awk '/^\[Peer\]/{p=1} p && /^PublicKey/{print $3; exit}' "$CONF")
 
     echo ""
     read -p "Удалить '$NAME'? (y/N): " CONFIRM
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && return
 
-    awg set "$VPN_IFACE" peer "$CLIENT_PUBLIC" remove
+    # Удаляем пир из живого интерфейса
+    [[ -n "$CLIENT_PUBLIC" ]] && awg set "$VPN_IFACE" peer "$CLIENT_PUBLIC" remove
 
+    # Удаляем блок из awg0.conf
     python3 - "$AWG_CONF" "$NAME" << 'PYEOF'
 import sys
 conf_path, name = sys.argv[1], sys.argv[2]
-with open(conf_path, 'r') as f:
+with open(conf_path, 'r', encoding='utf-8', errors='replace') as f:
     content = f.read()
 lines = content.split('\n')
 new_lines = []
@@ -283,7 +296,11 @@ with open(conf_path, 'w') as f:
     f.write('\n'.join(new_lines))
 PYEOF
 
+    # Удаляем все файлы клиента
     rm -f "$CLIENTS_DIR/${NAME}.conf"
+    rm -f "$CLIENTS_DIR/${NAME}.vpn"
+    rm -f "$CLIENTS_DIR/${NAME}.vpnlink"  # на случай старых файлов
+
     echo -e "${GREEN}✓ Клиент '$NAME' удалён${NC}"
     sleep 2
 }
@@ -308,6 +325,7 @@ show_status() {
     echo -e "  RAM:            ${CYAN}${RAM}${NC}"
     CLIENTS=$(ls "$CLIENTS_DIR"/*.conf 2>/dev/null | wc -l)
     echo -e "  Клиентов:       ${CYAN}${CLIENTS}${NC}"
+    echo -e "  DNS:            ${CYAN}${PRIMARY_DNS}, ${SECONDARY_DNS}${NC}"
     echo ""
     echo -e "${BOLD}awg show:${NC}"
     awg show "$VPN_IFACE" 2>/dev/null

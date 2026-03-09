@@ -13,6 +13,10 @@ info() { echo -e "${CYAN}[i]${NC} $1"; }
 
 [[ $EUID -ne 0 ]] && err "Запускать от root: sudo bash <(curl -s https://raw.githubusercontent.com/yntoolsmail-prog/Vpn_AWG/main/setup.sh)"
 
+# ── Проверка версии Ubuntu ────────────────────────────────────────────────────
+UBUNTU_VERSION=$(lsb_release -rs 2>/dev/null || echo "0")
+UBUNTU_MAJOR=$(echo "$UBUNTU_VERSION" | cut -d. -f1)
+
 clear
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
@@ -20,10 +24,25 @@ echo "  ║   AmneziaWG + Telegram Bot — Установка  ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
 
+info "Ubuntu ${UBUNTU_VERSION}"
+
+if [[ "$UBUNTU_MAJOR" -lt 22 ]]; then
+    err "Требуется Ubuntu 22.04 или 24.04"
+fi
+
+if [[ "$UBUNTU_MAJOR" -gt 24 ]]; then
+    warn "Ubuntu ${UBUNTU_VERSION} не тестировалась. Продолжаем..."
+fi
+
 # ── Шаг 1: Зависимости ────────────────────────────────────────────────────────
 log "Установка зависимостей..."
 apt-get update -qq
-apt-get install -y -qq curl wget software-properties-common resolvconf qrencode python3 python3-pip
+apt-get install -y -qq curl wget software-properties-common qrencode python3 python3-pip
+
+# resolvconf только для Ubuntu 22, на 24 он заменён systemd-resolved
+if [[ "$UBUNTU_MAJOR" -le 22 ]]; then
+    apt-get install -y -qq resolvconf
+fi
 
 # ── Шаг 2: AmneziaWG ──────────────────────────────────────────────────────────
 log "Добавление PPA Amnezia..."
@@ -118,7 +137,14 @@ systemctl daemon-reload
 systemctl enable awg-quick@awg0
 
 # ── Шаг 8: Сохраняем server.env ──────────────────────────────────────────────
-printf "SERVER_IP=%s\nSERVER_PORT=%s\nSERVER_PUBLIC=%s\nVPN_IFACE=awg0\nVPN_SUBNET=10.8.0\nJC=%s\nJMIN=%s\nJMAX=%s\nS1=%s\nS2=%s\nH1=%s\nH2=%s\nH3=%s\nH4=%s\n"     "$SERVER_IP" "$AWG_PORT" "$SERVER_PUBLIC"     "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$H1" "$H2" "$H3" "$H4"     > /etc/amnezia/amneziawg/server.env
+printf "SERVER_IP=%s\nSERVER_PORT=%s\nSERVER_PUBLIC=%s\nVPN_IFACE=awg0\nVPN_SUBNET=10.8.0\n" \
+    "$SERVER_IP" "$AWG_PORT" "$SERVER_PUBLIC" \
+    > /etc/amnezia/amneziawg/server.env
+printf "JC=%s\nJMIN=%s\nJMAX=%s\nS1=%s\nS2=%s\nH1=%s\nH2=%s\nH3=%s\nH4=%s\n" \
+    "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$H1" "$H2" "$H3" "$H4" \
+    >> /etc/amnezia/amneziawg/server.env
+printf "PRIMARY_DNS=1.1.1.1\nSECONDARY_DNS=1.0.0.1\n" \
+    >> /etc/amnezia/amneziawg/server.env
 
 # ── Шаг 9: Скачиваем скрипты ─────────────────────────────────────────────────
 log "Загрузка скриптов управления..."
@@ -205,6 +231,7 @@ echo -e "${GREEN}${BOLD}   Установка завершена!${NC}"
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════${NC}"
 echo ""
 info "AWG запущен с параметрами: Jc=$JC Jmin=$JMIN Jmax=$JMAX"
+info "DNS: 1.1.1.1, 1.0.0.1 (можно изменить, см. README)"
 info "Бот: systemctl status awg-bot"
 echo ""
 echo -e "  Терминал: ${CYAN}bash /root/vpn.sh${NC}"
